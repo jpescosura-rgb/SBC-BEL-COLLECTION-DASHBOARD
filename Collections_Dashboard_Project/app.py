@@ -1,0 +1,1585 @@
+"""
+SBC B2 BEL Collection Dashboard
+================================
+Enterprise-grade Streamlit dashboard for collections / field visit / curing
+performance monitoring, styled with Security Bank corporate branding.
+
+Run with:
+    streamlit run app.py
+"""
+
+import io
+import re
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+    HAS_AGGRID = True
+except Exception:
+    HAS_AGGRID = False
+
+# ============================================================================
+# PAGE CONFIG & SECURITY BANK THEME
+# ============================================================================
+
+st.set_page_config(
+    page_title="SBC B2 BEL Collection Dashboard",
+    page_icon="🏦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---- Security Bank corporate palette ----
+SB_BLUE = "#0057B8"
+SB_DARK_BLUE = "#003B7A"
+SB_LIGHT_BLUE = "#EAF3FF"
+SB_WHITE = "#FFFFFF"
+SB_GREEN = "#00A651"
+SB_ORANGE = "#F5A623"
+SB_RED = "#D32F2F"
+
+STATUS_COLORS = {
+    "Active": SB_BLUE,
+    "Cured": SB_GREEN,
+    "Flowed": SB_RED,
+}
+
+BLUES_SCALE = ["#EAF3FF", "#B3D4FF", "#66A3FF", "#0057B8", "#003B7A"]
+GREENS_SCALE = ["#E6F7EE", "#99E0BC", "#33C285", "#00A651", "#00753A"]
+REDS_SCALE = ["#FCE9E9", "#F0A8A8", "#E36767", "#D32F2F", "#8E1F1F"]
+
+CUSTOM_CSS = f"""
+<style>
+#MainMenu {{visibility: hidden;}}
+footer {{visibility: hidden;}}
+footer:after {{content:''; visibility: hidden;}}
+
+.stApp {{ background-color: #F5F8FC; }}
+
+/* ---- Header banner ---- */
+.sbc-header {{
+    background: linear-gradient(120deg, {SB_DARK_BLUE} 0%, {SB_BLUE} 100%);
+    padding: 22px 30px;
+    border-radius: 14px;
+    margin-bottom: 18px;
+    box-shadow: 0 4px 14px rgba(0,59,122,0.25);
+    display: flex;
+    align-items: center;
+    gap: 18px;
+}}
+.sbc-logo {{
+    width: 52px; height: 52px; border-radius: 10px;
+    background: {SB_WHITE};
+    display: flex; align-items: center; justify-content: center;
+    font-size: 26px; font-weight: 800; color: {SB_BLUE};
+    box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    flex-shrink: 0;
+}}
+.sbc-header-text h1 {{
+    color: {SB_WHITE} !important; margin: 0; font-size: 26px; font-weight: 800;
+    letter-spacing: 0.3px;
+}}
+.sbc-header-text p {{
+    color: {SB_LIGHT_BLUE} !important; margin: 2px 0 0 0; font-size: 13.5px;
+}}
+
+/* ---- Sidebar ---- */
+section[data-testid="stSidebar"] {{
+    background: linear-gradient(180deg, {SB_DARK_BLUE} 0%, {SB_BLUE} 100%);
+}}
+section[data-testid="stSidebar"] * {{ color: #EAF3FF !important; }}
+section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] {{
+    background-color: {SB_WHITE} !important;
+}}
+section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] span {{
+    color: {SB_DARK_BLUE} !important;
+}}
+section[data-testid="stSidebar"] div[data-baseweb="select"] > div {{
+    background-color: rgba(255,255,255,0.12);
+    border-radius: 8px;
+}}
+section[data-testid="stSidebar"] button {{
+    background-color: {SB_WHITE} !important;
+    color: {SB_DARK_BLUE} !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    border: none !important;
+}}
+
+/* ---- KPI cards ---- */
+div[data-testid="stMetric"] {{
+    background: {SB_WHITE};
+    border-radius: 12px;
+    padding: 16px 18px 12px 18px;
+    box-shadow: 0 2px 10px rgba(0,59,122,0.10);
+    border-left: 5px solid {SB_BLUE};
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+}}
+div[data-testid="stMetric"]:hover {{
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(0,59,122,0.18);
+}}
+div[data-testid="stMetric"] label {{ color: {SB_DARK_BLUE} !important; font-weight: 600 !important; }}
+div[data-testid="stMetric"] div[data-testid="stMetricValue"] {{ color: {SB_BLUE} !important; font-weight: 800 !important; }}
+
+/* ---- Headings ---- */
+h1, h2, h3 {{ color: {SB_DARK_BLUE}; font-weight: 800; }}
+h4, h5 {{ color: {SB_DARK_BLUE}; font-weight: 700; }}
+
+/* ---- Tabs ---- */
+.stTabs [data-baseweb="tab-list"] {{
+    gap: 4px; background-color: {SB_LIGHT_BLUE}; padding: 6px; border-radius: 12px;
+}}
+.stTabs [data-baseweb="tab"] {{
+    height: 42px; border-radius: 8px; padding: 0 16px; font-weight: 600;
+    color: {SB_DARK_BLUE}; background-color: transparent;
+}}
+.stTabs [data-baseweb="tab"]:hover {{ background-color: rgba(0,87,184,0.12); }}
+.stTabs [aria-selected="true"] {{
+    background-color: {SB_BLUE} !important; color: {SB_WHITE} !important;
+}}
+
+/* ---- Dataframes / tables ---- */
+div[data-testid="stDataFrame"] {{
+    border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,59,122,0.08);
+}}
+
+/* ---- Containers / expanders ---- */
+div[data-testid="stExpander"] {{
+    background-color: {SB_WHITE}; border-radius: 10px;
+    box-shadow: 0 1px 6px rgba(0,59,122,0.08);
+}}
+.block-container {{ padding-top: 1.2rem; }}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+PHP = lambda v: f"₱{v:,.2f}" if pd.notna(v) else "₱0.00"
+
+
+def fnum(v):
+    if pd.isna(v):
+        return "0"
+    return f"{v:,.0f}"
+
+
+def pct(v):
+    if pd.isna(v):
+        return "0.0%"
+    return f"{v:.1f}%"
+
+
+# ============================================================================
+# COLUMN RESOLUTION
+# ============================================================================
+
+COLUMN_ALIASES = {
+    "concat": ["concat", "concat id", "account id", "acct id"],
+    "account_name": ["account name", "accountname", "client name", "name"],
+    "ob_tad": ["ob/tad", "ob tad", "ob", "tad", "outstanding balance", "balance"],
+    "status": ["status"],
+    "substatus": ["substatus", "sub status", "sub-status"],
+    "area": ["area"],
+    "area2": ["area2", "area 2", "area break"],
+    "sub_area": ["sub area", "subarea", "province"],
+    "industry": ["industry"],
+    "agent": ["agent", "collector", "field agent"],
+    "action_date": ["action date"],
+    "endorsement_date": ["date of endorsement", "endorsement date", "date endorsed"],
+    "active": ["active", "active status"],
+    "remarks": ["remarks"],
+    "payment": ["payment"],
+    "openci": ["openci", "open ci"],
+    "fv_result": ["fv_result", "fv result", "field visit result"],
+    "tele_field": ["tele/field", "tele field", "channel"],
+    "area_list": ["area list"],
+    "cured_flag": ["cured/not cured", "cured not cured", "cured status"],
+    "risk_level": ["risk level", "risk lvl", "bom/fresh", "bom fresh"],
+    "bal_distro": ["bal distro", "balance distro", "bal distribution"],
+    "total_visits": ["total of visits made", "total visits", "visits made"],
+}
+
+REQUIRED_MIN = ["concat", "ob_tad", "status"]
+
+
+def resolve_columns(columns):
+    """Map logical field -> actual dataframe column name (best match)."""
+    used = set()
+    norm = {c: re.sub(r"\s+", " ", str(c).strip().lower()) for c in columns}
+    mapping = {}
+    for logical, aliases in COLUMN_ALIASES.items():
+        found = None
+        for alias in aliases:
+            for col, ncol in norm.items():
+                if col in used:
+                    continue
+                if ncol == alias:
+                    found = col
+                    break
+            if found:
+                break
+        if not found:
+            for alias in aliases:
+                for col, ncol in norm.items():
+                    if col in used:
+                        continue
+                    if alias in ncol:
+                        found = col
+                        break
+                if found:
+                    break
+        if found:
+            mapping[logical] = found
+            used.add(found)
+    return mapping
+
+
+def clean_numeric(series):
+    s = series.astype(str).str.replace(r"[₱$,]", "", regex=True).str.strip()
+    s = s.replace({"": np.nan, "nan": np.nan, "None": np.nan, "-": np.nan})
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+
+def clean_date(series):
+    return pd.to_datetime(series, errors="coerce")
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def load_file(file_bytes, file_name):
+    """Read uploaded file bytes into a DataFrame."""
+    if file_name.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes), low_memory=False)
+    else:
+        df = pd.read_excel(io.BytesIO(file_bytes))
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def prepare_data(df: pd.DataFrame):
+    mapping = resolve_columns(df.columns)
+    missing = [f for f in REQUIRED_MIN if f not in mapping]
+
+    work = pd.DataFrame(index=df.index)
+    for logical, actual in mapping.items():
+        work[logical] = df[actual]
+
+    for logical in COLUMN_ALIASES:
+        if logical not in work.columns:
+            work[logical] = np.nan
+
+    work["ob_tad"] = clean_numeric(work["ob_tad"])
+    work["total_visits"] = clean_numeric(work["total_visits"])
+    work["action_date"] = clean_date(work["action_date"])
+    work["endorsement_date"] = clean_date(work["endorsement_date"])
+
+    for c in ["status", "substatus", "industry", "agent", "area", "area2",
+              "sub_area", "active", "fv_result", "tele_field",
+              "area_list", "cured_flag", "risk_level", "bal_distro"]:
+        work[c] = work[c].astype(str).str.strip()
+        work[c] = work[c].replace({"nan": "Unspecified", "": "Unspecified", "None": "Unspecified"})
+
+    work["concat"] = work["concat"].astype(str).str.strip()
+    work["status_norm"] = work["status"].str.title()
+    work["has_payment"] = work["payment"].astype(str).str.strip().replace(
+        {"nan": "", "None": ""}
+    ).ne("")
+
+    def _bom_fresh(v):
+        vl = str(v).lower()
+        if "bom" in vl:
+            return "BOM"
+        if "fresh" in vl:
+            return "FRESH"
+        return v
+
+    work["bom_fresh"] = work["risk_level"].apply(_bom_fresh)
+
+    return work, mapping, missing
+
+
+# ============================================================================
+# AGGREGATION HELPERS
+# ============================================================================
+
+def distinct_accounts(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per distinct concat (dedup for portfolio-level counts)."""
+    return df.drop_duplicates(subset=["concat"])
+
+
+def summarize_by(df: pd.DataFrame, group_col: str, value_col: str = "ob_tad",
+                  id_col: str = "concat") -> pd.DataFrame:
+    """Distinct-count accounts and sum balance per group, dedup on (id, group)."""
+    tmp = df.dropna(subset=[group_col])
+    tmp = tmp[tmp[group_col] != "Unspecified"] if tmp[group_col].dtype == object else tmp
+    dedup = tmp.drop_duplicates(subset=[id_col, group_col])
+    out = dedup.groupby(group_col, dropna=False).agg(
+        Accounts=(id_col, "nunique"),
+        Balance=(value_col, "sum"),
+    ).reset_index()
+    total_accounts = df.drop_duplicates(subset=[id_col])[id_col].nunique()
+    out["Pct of Accounts"] = (out["Accounts"] / total_accounts * 100) if total_accounts else 0
+    return out.sort_values("Balance", ascending=False)
+
+
+def status_summary(df: pd.DataFrame) -> pd.DataFrame:
+    acc = distinct_accounts(df)
+    rows = []
+    for st_name in ["Active", "Flowed", "Cured"]:
+        sub = acc[acc["status_norm"] == st_name]
+        rows.append({
+            "Status": st_name,
+            "Accounts": sub["concat"].nunique(),
+            "Balance": sub["ob_tad"].sum(),
+        })
+    out = pd.DataFrame(rows)
+    total_acc = acc["concat"].nunique()
+    total_bal = acc["ob_tad"].sum()
+    out["Pct Accounts"] = (out["Accounts"] / total_acc * 100) if total_acc else 0
+    out["Pct Balance"] = (out["Balance"] / total_bal * 100) if total_bal else 0
+    return out
+
+
+def full_status_matrix(df: pd.DataFrame, group_col: str, label_name: str) -> pd.DataFrame:
+    """Generic Total/Active/Cured/Flowed count & balance matrix, with a TOTAL row.
+    Column order matches: <label>, Total Count, Total Balance,
+    Active Count, Active Balance, Cured Count, Cured Balance,
+    Flowed Count, Flowed Balance."""
+    acc = distinct_accounts(df)
+    acc = acc[acc[group_col] != "Unspecified"] if acc[group_col].dtype == object else acc
+    rows = []
+    for val, grp in acc.groupby(group_col):
+        row = {label_name: val, "Total Count": grp["concat"].nunique(),
+               "Total Balance": grp["ob_tad"].sum()}
+        for st_name in ["Active", "Cured", "Flowed"]:
+            s = grp[grp["status_norm"] == st_name]
+            row[f"{st_name} Count"] = s["concat"].nunique()
+            row[f"{st_name} Balance"] = s["ob_tad"].sum()
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out = out.sort_values("Total Balance", ascending=False)
+    total = {label_name: "TOTAL"}
+    for c in out.columns:
+        if c != label_name:
+            total[c] = out[c].sum()
+    out = pd.concat([out, pd.DataFrame([total])], ignore_index=True)
+    return out
+
+
+def cure_summary_by(df: pd.DataFrame, group_col: str, label_name: str) -> pd.DataFrame:
+    """Cured-based (Status = CURED) analysis: Total Accounts, Cured Accounts,
+    Cure Rate %, Cured Balance — used for the Cured/Payment dashboard tables."""
+    acc = distinct_accounts(df)
+    acc = acc[acc[group_col] != "Unspecified"] if acc[group_col].dtype == object else acc
+    rows = []
+    for val, grp in acc.groupby(group_col):
+        total_accounts = grp["concat"].nunique()
+        cured = grp[grp["status_norm"] == "Cured"]
+        cured_accounts = cured["concat"].nunique()
+        rows.append({
+            label_name: val,
+            "Total Accounts": total_accounts,
+            "Cured Accounts": cured_accounts,
+            "Cure Rate %": (cured_accounts / total_accounts * 100) if total_accounts else 0,
+            "Cured Balance": cured["ob_tad"].sum(),
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values("Cured Balance", ascending=False)
+
+
+def agent_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    acc = distinct_accounts(df)
+    rows = []
+    for agent, grp in acc.groupby("agent"):
+        row = {"Agent": agent, "Endorsed Accounts": grp["concat"].nunique(),
+               "Endorsed Balance": grp["ob_tad"].sum()}
+        for st_name in ["Active", "Flowed", "Cured"]:
+            s = grp[grp["status_norm"] == st_name]
+            row[f"{st_name} Accounts"] = s["concat"].nunique()
+            row[f"{st_name} Balance"] = s["ob_tad"].sum()
+        row["Cure %"] = (row.get("Cured Accounts", 0) / row["Endorsed Accounts"] * 100
+                          if row["Endorsed Accounts"] else 0)
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("Endorsed Balance", ascending=False)
+
+
+# ============================================================================
+# GEO / MAP HELPERS (Philippine provinces, for the Area List map dashboard)
+# ============================================================================
+
+PH_PROVINCE_COORDS = {
+    "NCR": (14.5995, 120.9842), "METRO MANILA": (14.5995, 120.9842),
+    "NATIONAL CAPITAL REGION": (14.5995, 120.9842),
+    "ABRA": (17.5951, 120.7983), "AGUSAN DEL NORTE": (8.9450, 125.5319),
+    "AGUSAN DEL SUR": (8.1661, 125.9528), "AKLAN": (11.8166, 122.0942),
+    "ALBAY": (13.1775, 123.5280), "ANTIQUE": (11.3357, 122.0602),
+    "APAYAO": (18.0085, 121.1651), "AURORA": (15.7594, 121.5591),
+    "BASILAN": (6.4221, 121.9690), "BATAAN": (14.6417, 120.4818),
+    "BATANES": (20.4487, 121.9702), "BATANGAS": (13.9294, 121.1637),
+    "BENGUET": (16.4023, 120.5960), "BILIRAN": (11.5836, 124.4645),
+    "BOHOL": (9.8500, 124.1435), "BUKIDNON": (8.0515, 125.0985),
+    "BULACAN": (14.7943, 120.8792), "CAGAYAN": (17.9989, 121.7534),
+    "CAMARINES NORTE": (14.1391, 122.7573), "CAMARINES SUR": (13.6252, 123.1829),
+    "CAMIGUIN": (9.1736, 124.7300), "CAPIZ": (11.3889, 122.6277),
+    "CATANDUANES": (13.7089, 124.2422), "CAVITE": (14.2456, 120.8786),
+    "CEBU": (10.3157, 123.8854), "COTABATO": (7.2072, 124.2422),
+    "DAVAO DE ORO": (7.6167, 126.1667), "COMPOSTELA VALLEY": (7.6167, 126.1667),
+    "DAVAO DEL NORTE": (7.5619, 125.6549), "DAVAO DEL SUR": (6.7656, 125.3284),
+    "DAVAO OCCIDENTAL": (6.1000, 125.6000), "DAVAO ORIENTAL": (7.3172, 126.5420),
+    "DINAGAT ISLANDS": (10.1281, 125.6094), "EASTERN SAMAR": (11.6067, 125.5000),
+    "GUIMARAS": (10.5928, 122.6325), "IFUGAO": (16.8300, 121.1710),
+    "ILOCOS NORTE": (18.1647, 120.7116), "ILOCOS SUR": (17.5755, 120.3869),
+    "ILOILO": (10.7202, 122.5621), "ISABELA": (17.0000, 121.8333),
+    "KALINGA": (17.4766, 121.3521), "LA UNION": (16.6159, 120.3209),
+    "LAGUNA": (14.2691, 121.4113), "LANAO DEL NORTE": (8.1156, 123.9210),
+    "LANAO DEL SUR": (7.8232, 124.4357), "LEYTE": (10.8731, 124.8811),
+    "MAGUINDANAO": (6.9423, 124.4198), "MAGUINDANAO DEL NORTE": (7.1800, 124.4500),
+    "MAGUINDANAO DEL SUR": (6.9000, 124.4000),
+    "MARINDUQUE": (13.4771, 121.9032), "MASBATE": (12.3686, 123.6417),
+    "MISAMIS OCCIDENTAL": (8.3375, 123.7071), "MISAMIS ORIENTAL": (8.6109, 124.7739),
+    "MOUNTAIN PROVINCE": (17.0417, 121.1087), "NEGROS OCCIDENTAL": (10.4275, 122.9847),
+    "NEGROS ORIENTAL": (9.6168, 123.0113), "NORTHERN SAMAR": (12.4700, 124.6400),
+    "NUEVA ECIJA": (15.5784, 121.0687), "NUEVA VIZCAYA": (16.3301, 121.1710),
+    "OCCIDENTAL MINDORO": (13.1024, 120.7651), "ORIENTAL MINDORO": (13.0565, 121.4069),
+    "PALAWAN": (9.8349, 118.7384), "PAMPANGA": (15.0794, 120.6200),
+    "PANGASINAN": (15.8949, 120.2863), "QUEZON": (14.0313, 122.1106),
+    "QUIRINO": (16.3676, 121.5479), "RIZAL": (14.6037, 121.3084),
+    "ROMBLON": (12.5778, 122.2695), "SAMAR": (11.9804, 124.9944),
+    "SARANGANI": (5.9591, 125.2228), "SIQUIJOR": (9.1911, 123.5952),
+    "SORSOGON": (12.9743, 124.0150), "SOUTH COTABATO": (6.2969, 124.8511),
+    "SOUTHERN LEYTE": (10.3365, 125.1717), "SULTAN KUDARAT": (6.5069, 124.4169),
+    "SULU": (6.0474, 121.0024), "SURIGAO DEL NORTE": (9.7899, 125.4947),
+    "SURIGAO DEL SUR": (8.7512, 126.1378), "TARLAC": (15.4802, 120.5979),
+    "TAWI-TAWI": (5.1339, 119.9552), "ZAMBALES": (15.5082, 120.0691),
+    "ZAMBOANGA DEL NORTE": (8.1527, 123.2577), "ZAMBOANGA DEL SUR": (7.8383, 123.2984),
+    "ZAMBOANGA SIBUGAY": (7.5222, 122.8198),
+}
+
+
+def geocode_area(name: str):
+    """Best-effort match of a free-text area/province label to PH lat/lon."""
+    if not name or str(name).strip() in ("", "nan", "None", "Unspecified"):
+        return None
+    key = re.sub(r"\s+", " ", str(name).strip().upper())
+    if key in PH_PROVINCE_COORDS:
+        return PH_PROVINCE_COORDS[key]
+    for province, coords in PH_PROVINCE_COORDS.items():
+        if province in key or key in province:
+            return coords
+    return None
+
+
+def style_and_write_sheet(ws, header_fill_hex="0057B8"):
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    header_fill = PatternFill("solid", fgColor=header_fill_hex)
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.freeze_panes = "A2"
+    for i, col_cells in enumerate(ws.columns, start=1):
+        header_val = str(col_cells[0].value) if col_cells[0].value is not None else ""
+        max_len = max([len(str(c.value)) if c.value is not None else 0 for c in col_cells] + [len(header_val)])
+        col_letter = get_column_letter(i)
+        ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 42)
+        if "balance" in header_val.lower() or header_val.lower() in ("ob", "ob/tad"):
+            for c in col_cells[1:]:
+                if isinstance(c.value, (int, float)):
+                    c.number_format = '"₱"#,##0.00'
+        if i % 2 == 0:
+            for r_idx, c in enumerate(col_cells[1:], start=2):
+                if r_idx % 2 == 0:
+                    from openpyxl.styles import PatternFill as PF
+                    c.fill = PF("solid", fgColor="EAF3FF")
+
+
+def to_excel_bytes(sheets: dict, title="SBC B2 BEL Collection Dashboard") -> bytes:
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        wb = writer.book
+        info_ws = wb.create_sheet("Report Info", 0)
+        info_ws["B2"] = title
+        info_ws["B2"].font = Font(size=20, bold=True, color="FFFFFF")
+        info_ws["B2"].fill = PatternFill("solid", fgColor="0057B8")
+        info_ws.merge_cells("B2:G4")
+        for row in info_ws["B2:G4"]:
+            for cell in row:
+                cell.fill = PatternFill("solid", fgColor="0057B8")
+        info_ws["B6"] = "Security Bank Collections — Executive Report"
+        info_ws["B6"].font = Font(size=12, italic=True, color="003B7A")
+        info_ws["B7"] = f"Generated: {datetime.now().strftime('%B %d, %Y %I:%M %p')}"
+        info_ws["B7"].font = Font(size=11, color="333333")
+        info_ws.column_dimensions["A"].width = 3
+
+        for name, d in sheets.items():
+            d.to_excel(writer, sheet_name=name[:31], index=False)
+
+        for name in sheets:
+            ws = wb[name[:31]]
+            style_and_write_sheet(ws)
+
+    return buf.getvalue()
+
+
+# ============================================================================
+# SIDEBAR — FILE UPLOAD
+# ============================================================================
+
+st.markdown(
+    f"""
+    <div class="sbc-header">
+        <div class="sbc-logo">SB</div>
+        <div class="sbc-header-text">
+            <h1>SBC B2 BEL Collection Dashboard</h1>
+            <p>Executive Collections &amp; Curing Performance Monitoring · Security Bank</p>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.sidebar.title("📁 Data Source")
+uploaded = st.sidebar.file_uploader(
+    "Upload collections file",
+    type=["xlsx", "xls", "csv"],
+    help="Upload the Field Collections monitoring extract (XLSX, XLS, or CSV).",
+)
+
+if not uploaded:
+    st.info(
+        "👈 Upload an XLSX, XLS, or CSV file from the sidebar to begin. "
+        "The dashboard supports large datasets (100,000+ rows) and will "
+        "auto-detect columns such as **concat**, **OB/TAD**, **Status**, "
+        "**Industry**, **Agent**, **Area**, and **FV Result**."
+    )
+    st.stop()
+
+raw_bytes = uploaded.getvalue()
+with st.spinner("Loading file..."):
+    raw_df = load_file(raw_bytes, uploaded.name)
+
+with st.spinner("Processing and validating data..."):
+    data, colmap, missing_fields = prepare_data(raw_df)
+
+if missing_fields:
+    st.sidebar.warning(
+        "Some key columns were not auto-detected: "
+        + ", ".join(missing_fields)
+        + ". Related metrics may show as zero/Unspecified."
+    )
+
+st.sidebar.success(f"Loaded {len(raw_df):,} rows · {distinct_accounts(data)['concat'].nunique():,} distinct accounts")
+
+with st.sidebar.expander("🔎 Detected column mapping"):
+    st.dataframe(pd.DataFrame(
+        [{"Field": k, "Source Column": v} for k, v in colmap.items()]
+    ), hide_index=True, use_container_width=True)
+
+# ============================================================================
+# SIDEBAR — FILTERS
+# ============================================================================
+
+st.sidebar.markdown("---")
+st.sidebar.title("🎛️ Filters")
+
+if st.sidebar.button("🔄 Clear all filters"):
+    for k in list(st.session_state.keys()):
+        if k.startswith("flt_"):
+            del st.session_state[k]
+    st.rerun()
+
+
+def multiselect_filter(label, col, key):
+    opts = sorted([o for o in data[col].dropna().unique() if o != ""])
+    return st.sidebar.multiselect(label, opts, key=f"flt_{key}")
+
+
+f_status = multiselect_filter("Status", "status", "status")
+f_substatus = multiselect_filter("Tele Result (SubStatus)", "substatus", "substatus")
+f_industry = multiselect_filter("Industry", "industry", "industry")
+f_area = multiselect_filter("Area", "area", "area")
+f_area2 = multiselect_filter("Area 2 / Area Break", "area2", "area2")
+f_agent = multiselect_filter("Agent", "agent", "agent")
+f_active = multiselect_filter("Active Status", "active", "active")
+f_fv = multiselect_filter("Field Result (Fv_Result)", "fv_result", "fv")
+f_product = multiselect_filter("Product Type (Tele/Field)", "tele_field", "product")
+f_riskclass = multiselect_filter("BOM / FRESH", "bom_fresh", "bomfresh")
+
+min_end = data["endorsement_date"].min()
+max_end = data["endorsement_date"].max()
+f_end_date = None
+if pd.notna(min_end) and pd.notna(max_end):
+    f_end_date = st.sidebar.date_input(
+        "Date of Endorsement range", value=(min_end.date(), max_end.date()),
+        min_value=min_end.date(), max_value=max_end.date(), key="flt_enddate",
+    )
+
+min_act = data["action_date"].min()
+max_act = data["action_date"].max()
+f_act_date = None
+if pd.notna(min_act) and pd.notna(max_act):
+    f_act_date = st.sidebar.date_input(
+        "Action Date range", value=(min_act.date(), max_act.date()),
+        min_value=min_act.date(), max_value=max_act.date(), key="flt_actdate",
+    )
+
+filtered = data.copy()
+if f_status:
+    filtered = filtered[filtered["status"].isin(f_status)]
+if f_substatus:
+    filtered = filtered[filtered["substatus"].isin(f_substatus)]
+if f_industry:
+    filtered = filtered[filtered["industry"].isin(f_industry)]
+if f_area:
+    filtered = filtered[filtered["area"].isin(f_area)]
+if f_area2:
+    filtered = filtered[filtered["area2"].isin(f_area2)]
+if f_agent:
+    filtered = filtered[filtered["agent"].isin(f_agent)]
+if f_active:
+    filtered = filtered[filtered["active"].isin(f_active)]
+if f_fv:
+    filtered = filtered[filtered["fv_result"].isin(f_fv)]
+if f_product:
+    filtered = filtered[filtered["tele_field"].isin(f_product)]
+if f_riskclass:
+    filtered = filtered[filtered["bom_fresh"].isin(f_riskclass)]
+if f_end_date and len(f_end_date) == 2:
+    start, end = pd.Timestamp(f_end_date[0]), pd.Timestamp(f_end_date[1])
+    filtered = filtered[
+        filtered["endorsement_date"].isna()
+        | filtered["endorsement_date"].between(start, end)
+    ]
+if f_act_date and len(f_act_date) == 2:
+    start, end = pd.Timestamp(f_act_date[0]), pd.Timestamp(f_act_date[1])
+    filtered = filtered[
+        filtered["action_date"].isna()
+        | filtered["action_date"].between(start, end)
+    ]
+
+if filtered.empty:
+    st.warning("No records match the current filter selection.")
+    st.stop()
+
+st.caption(
+    f"Data as of {datetime.now().strftime('%B %d, %Y %I:%M %p')} · "
+    f"Showing {distinct_accounts(filtered)['concat'].nunique():,} of "
+    f"{distinct_accounts(data)['concat'].nunique():,} distinct accounts"
+)
+
+tabs = st.tabs([
+    "🏦 Executive Summary", "🏭 Industry", "🧑‍💼 Agent", "📞 Tele & Field Results",
+    "🗺️ Area", "🌍 Area Map", "📶 Active Status", "💚 Cured / Payment",
+    "📋 Account Details", "⬇️ Downloads",
+])
+
+# ============================================================================
+# TAB 1 — EXECUTIVE SUMMARY
+# ============================================================================
+
+with tabs[0]:
+    acc = distinct_accounts(filtered)
+    total_accounts = acc["concat"].nunique()
+    total_balance = acc["ob_tad"].sum()
+
+    def bucket_status(status_name):
+        s = acc[acc["status_norm"] == status_name]
+        return s["concat"].nunique(), s["ob_tad"].sum()
+
+    active_acc, active_bal = bucket_status("Active")
+    flowed_acc, flowed_bal = bucket_status("Flowed")
+    cured_acc, cured_bal = bucket_status("Cured")
+    cure_rate = (cured_acc / total_accounts * 100) if total_accounts else 0
+    cure_bal_rate = (cured_bal / total_balance * 100) if total_balance else 0
+
+    st.subheader("Executive KPIs")
+    r1 = st.columns(5)
+    r1[0].metric("Total Endorsed Accounts", fnum(total_accounts))
+    r1[1].metric("Total Outstanding Balance", PHP(total_balance))
+    r1[2].metric("Active Accounts", fnum(active_acc))
+    r1[3].metric("Active Balance", PHP(active_bal))
+    r1[4].metric("Flowed Accounts", fnum(flowed_acc))
+
+    r2 = st.columns(5)
+    r2[0].metric("Flowed Balance", PHP(flowed_bal))
+    r2[1].metric("Cured Accounts", fnum(cured_acc))
+    r2[2].metric("Cured Balance", PHP(cured_bal))
+    r2[3].metric("Cure Rate", pct(cure_rate))
+    r2[4].metric("Cure Balance Rate", pct(cure_bal_rate))
+
+    st.markdown("### Status Distribution")
+    ss = status_summary(filtered)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        fig = px.pie(ss, names="Status", values="Accounts", title="Accounts by Status",
+                     color="Status", color_discrete_map=STATUS_COLORS, hole=0)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_1")
+    with c2:
+        fig = px.pie(ss, names="Status", values="Balance", title="Balance by Status (Donut)",
+                     color="Status", color_discrete_map=STATUS_COLORS, hole=0.5)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_2")
+    with c3:
+        m = ss.melt(id_vars="Status", value_vars=["Accounts", "Balance"],
+                     var_name="Metric", value_name="Value")
+        fig = px.bar(m, x="Status", y="Value", color="Status", facet_col="Metric",
+                     color_discrete_map=STATUS_COLORS, title="Accounts & Balance by Status")
+        fig.update_yaxes(matches=None)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_3")
+
+    st.dataframe(
+        ss.style.format({"Balance": PHP, "Pct Accounts": "{:.1f}%", "Pct Balance": "{:.1f}%"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    # ---- BOM / FRESH (from Risk Level) ----
+    st.markdown("---")
+    st.markdown("### 🏷️ BOM / FRESH (Risk Level)")
+    bomfresh = summarize_by(filtered, "bom_fresh").rename(columns={"bom_fresh": "BOM/FRESH"})
+    if not bomfresh.empty:
+        bom_row = bomfresh[bomfresh["BOM/FRESH"] == "BOM"]
+        fresh_row = bomfresh[bomfresh["BOM/FRESH"] == "FRESH"]
+        total_bom_count = int(bom_row["Accounts"].sum())
+        total_bom_ob = bom_row["Balance"].sum()
+        total_fresh_count = int(fresh_row["Accounts"].sum())
+        total_fresh_ob = fresh_row["Balance"].sum()
+
+        r3 = st.columns(4)
+        r3[0].metric("Total BOM Count", fnum(total_bom_count))
+        r3[1].metric("Total BOM OB", PHP(total_bom_ob))
+        r3[2].metric("Total FRESH Count", fnum(total_fresh_count))
+        r3[3].metric("Total FRESH OB", PHP(total_fresh_ob))
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            fig = px.bar(bomfresh, x="BOM/FRESH", y="Accounts", color="BOM/FRESH",
+                         title="BOM vs FRESH — Account Count",
+                         color_discrete_sequence=[SB_ORANGE, SB_BLUE])
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_4")
+        with c2:
+            fig = px.pie(bomfresh, names="BOM/FRESH", values="Accounts", hole=0.5,
+                         title="BOM vs FRESH — Donut",
+                         color_discrete_sequence=[SB_ORANGE, SB_BLUE])
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_5")
+        with c3:
+            fig = px.bar(bomfresh, x="BOM/FRESH", y="Balance", color="BOM/FRESH",
+                         title="BOM vs FRESH — OB Distribution",
+                         color_discrete_sequence=[SB_ORANGE, SB_BLUE])
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_6")
+        st.dataframe(bomfresh.style.format({"Balance": PHP, "Pct of Accounts": "{:.1f}%"}),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No Risk Level (BOM/FRESH) values detected in this dataset.")
+
+    # ---- Balance Distribution (BAL Distro) ----
+    st.markdown("---")
+    st.markdown("### 💵 Balance Distribution (BAL Distro)")
+    bal_mat = full_status_matrix(filtered, "bal_distro", "BAL Distro")
+    if not bal_mat.empty:
+        money_cols = [c for c in bal_mat.columns if "Balance" in c]
+        st.dataframe(bal_mat.style.format({c: PHP for c in money_cols}),
+                     use_container_width=True, hide_index=True)
+        bal_body = bal_mat[bal_mat["BAL Distro"] != "TOTAL"]
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = px.bar(bal_body.sort_values("Total Count"),
+                         x="Total Count", y="BAL Distro", orientation="h",
+                         title="Balance Distribution — Accounts by Bucket",
+                         color="Total Count", color_continuous_scale=BLUES_SCALE)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_7")
+        with c2:
+            long = bal_body[["BAL Distro", "Active Count", "Cured Count", "Flowed Count"]].melt(
+                id_vars="BAL Distro", value_vars=["Active Count", "Cured Count", "Flowed Count"],
+                var_name="Status", value_name="Accounts",
+            )
+            long["Status"] = long["Status"].str.replace(" Count", "")
+            fig = px.bar(long, x="BAL Distro", y="Accounts", color="Status", barmode="stack",
+                         color_discrete_map=STATUS_COLORS, title="Balance Distribution by Status")
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_8")
+        fig = px.treemap(bal_body, path=["BAL Distro"], values="Total Balance",
+                          color="Total Balance", color_continuous_scale=BLUES_SCALE,
+                          title="Treemap by BAL Distro")
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_9")
+    else:
+        st.info("No BAL Distro values detected in this dataset.")
+
+# ============================================================================
+# TAB 2 — INDUSTRY DASHBOARD
+# ============================================================================
+
+with tabs[1]:
+    st.subheader("Industry Performance Matrix")
+    imat = full_status_matrix(filtered, "industry", "INDUSTRY")
+    money_cols = [c for c in imat.columns if "Balance" in c]
+    st.dataframe(
+        imat.style.format({c: PHP for c in money_cols}),
+        use_container_width=True, hide_index=True, height=420,
+    )
+
+    body = imat[imat["INDUSTRY"] != "TOTAL"]
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(body.sort_values("Total Balance", ascending=True),
+                     x="Total Balance", y="INDUSTRY", orientation="h",
+                     title="Industry Balance Ranking", color="Total Balance",
+                     color_continuous_scale=BLUES_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_10")
+    with c2:
+        long = body[["INDUSTRY", "Active Count", "Cured Count", "Flowed Count"]].melt(
+            id_vars="INDUSTRY", value_vars=["Active Count", "Cured Count", "Flowed Count"],
+            var_name="Status", value_name="Accounts",
+        )
+        long["Status"] = long["Status"].str.replace(" Count", "")
+        fig = px.bar(long, x="INDUSTRY", y="Accounts", color="Status",
+                     color_discrete_map=STATUS_COLORS, title="Industry Status Distribution")
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_11")
+
+    fig = px.treemap(body, path=["INDUSTRY"], values="Total Balance",
+                      color="Total Balance", color_continuous_scale=BLUES_SCALE,
+                      title="Industry Treemap (by Balance)")
+    st.plotly_chart(fig, use_container_width=True, key=f"chart_12")
+
+    st.markdown("### 💚 Cured Accounts & Balance by Industry")
+    cure_ind = cure_summary_by(filtered, "industry", "Industry")
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(cure_ind.sort_values("Cured Accounts"), x="Cured Accounts", y="Industry",
+                     orientation="h", title="Cured Accounts by Industry", color="Cured Accounts",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_13")
+    with c2:
+        fig = px.bar(cure_ind.sort_values("Cured Balance"), x="Cured Balance", y="Industry",
+                     orientation="h", title="Cured Balance by Industry", color="Cured Balance",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_14")
+
+    st.markdown("### 🏆 Industry Cure Rate Ranking")
+    cure_ind_ranked = cure_ind.sort_values("Cure Rate %", ascending=True)
+    fig = px.bar(cure_ind_ranked, x="Cure Rate %", y="Industry", orientation="h",
+                 title="Industry Cure Rate Ranking", color="Cure Rate %",
+                 color_continuous_scale=GREENS_SCALE)
+    st.plotly_chart(fig, use_container_width=True, key=f"chart_15")
+
+    st.markdown("### 🔎 Drill-Down: Industry → Tele Result / Field Result")
+    industry_options = sorted([i for i in body["INDUSTRY"].unique()])
+    if industry_options:
+        sel_industry = st.selectbox("Select an Industry to drill into", industry_options, key="industry_drilldown")
+        ind_slice = filtered[filtered["industry"] == sel_industry]
+        c1, c2 = st.columns(2)
+        with c1:
+            tele_dist = summarize_by(ind_slice, "substatus").rename(columns={"substatus": "Tele Result"})
+            fig = px.bar(tele_dist.sort_values("Accounts"), x="Accounts", y="Tele Result",
+                         orientation="h", title=f"{sel_industry} → Tele Result Distribution",
+                         color="Accounts", color_continuous_scale=BLUES_SCALE)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_16")
+        with c2:
+            field_dist = summarize_by(ind_slice, "fv_result").rename(columns={"fv_result": "Field Result"})
+            fig = px.bar(field_dist.sort_values("Accounts"), x="Accounts", y="Field Result",
+                         orientation="h", title=f"{sel_industry} → Field Result Distribution",
+                         color="Accounts", color_continuous_scale=GREENS_SCALE)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_17")
+
+    st.markdown("### Industry vs Tele Result / Field Result (Overall)")
+    c1, c2 = st.columns(2)
+    with c1:
+        tele_by_ind = filtered.dropna(subset=["industry", "substatus"])
+        tele_by_ind = tele_by_ind[(tele_by_ind["industry"] != "Unspecified") & (tele_by_ind["substatus"] != "Unspecified")]
+        pivot_tele = distinct_accounts(tele_by_ind).pivot_table(
+            index="industry", columns="substatus", values="concat", aggfunc="nunique", fill_value=0)
+        top_tele_cols = pivot_tele.sum(axis=0).sort_values(ascending=False).head(8).index
+        m = pivot_tele[top_tele_cols].reset_index().melt(id_vars="industry", var_name="Tele Result", value_name="Accounts")
+        fig = px.bar(m, x="industry", y="Accounts", color="Tele Result",
+                     title="Industry vs Tele Result (Top Categories)")
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_18")
+    with c2:
+        field_by_ind = filtered.dropna(subset=["industry", "fv_result"])
+        field_by_ind = field_by_ind[(field_by_ind["industry"] != "Unspecified") & (field_by_ind["fv_result"] != "Unspecified")]
+        pivot_field = distinct_accounts(field_by_ind).pivot_table(
+            index="industry", columns="fv_result", values="concat", aggfunc="nunique", fill_value=0)
+        top_field_cols = pivot_field.sum(axis=0).sort_values(ascending=False).head(8).index
+        m = pivot_field[top_field_cols].reset_index().melt(id_vars="industry", var_name="Field Result", value_name="Accounts")
+        fig = px.bar(m, x="industry", y="Accounts", color="Field Result",
+                     title="Industry vs Field Result (Top Categories)")
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_19")
+
+# ============================================================================
+# TAB 3 — AGENT DASHBOARD
+# ============================================================================
+
+with tabs[2]:
+    st.subheader("Agent Performance")
+    amat = agent_matrix(filtered)
+    money_cols = [c for c in amat.columns if "Balance" in c]
+    st.dataframe(
+        amat.style.format({**{c: PHP for c in money_cols}, "Cure %": "{:.1f}%"}),
+        use_container_width=True, hide_index=True, height=420,
+    )
+
+    top20 = amat.head(20)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        fig = px.bar(top20.sort_values("Endorsed Balance"), x="Endorsed Balance", y="Agent",
+                     orientation="h", title="Top 20 Agents by Balance",
+                     color="Endorsed Balance", color_continuous_scale=BLUES_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_20")
+    with c2:
+        t = amat.sort_values("Cure %", ascending=False).head(20)
+        fig = px.bar(t.sort_values("Cure %"), x="Cure %", y="Agent", orientation="h",
+                     title="Top 20 Agents by Cure Rate", color="Cure %",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_21")
+    with c3:
+        t = amat.sort_values("Endorsed Accounts", ascending=False).head(20)
+        fig = px.bar(t.sort_values("Endorsed Accounts"), x="Endorsed Accounts", y="Agent",
+                     orientation="h", title="Top 20 Agents by # of Accounts",
+                     color="Endorsed Accounts", color_continuous_scale=BLUES_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_22")
+
+    st.markdown("### 🏆 Agent Leaderboards")
+    lb_tabs = st.tabs(["Highest Accounts", "Highest OB", "Highest Cured Count",
+                       "Highest Cured Balance", "Highest Cure Rate %"])
+    with lb_tabs[0]:
+        lb = amat.sort_values("Endorsed Accounts", ascending=False).reset_index(drop=True)
+        lb.insert(0, "Rank", lb.index + 1)
+        st.dataframe(
+            lb[["Rank", "Agent", "Endorsed Accounts", "Endorsed Balance"]].head(15)
+            .style.format({"Endorsed Balance": PHP}),
+            use_container_width=True, hide_index=True,
+        )
+    with lb_tabs[1]:
+        lb = amat.sort_values("Endorsed Balance", ascending=False).reset_index(drop=True)
+        lb.insert(0, "Rank", lb.index + 1)
+        st.dataframe(
+            lb[["Rank", "Agent", "Endorsed Balance", "Endorsed Accounts"]].head(15)
+            .style.format({"Endorsed Balance": PHP}),
+            use_container_width=True, hide_index=True,
+        )
+    with lb_tabs[2]:
+        lb = amat.sort_values("Cured Accounts", ascending=False).reset_index(drop=True)
+        lb.insert(0, "Rank", lb.index + 1)
+        st.dataframe(
+            lb[["Rank", "Agent", "Cured Accounts", "Cured Balance", "Cure %"]].head(15)
+            .style.format({"Cured Balance": PHP, "Cure %": "{:.1f}%"}),
+            use_container_width=True, hide_index=True,
+        )
+    with lb_tabs[3]:
+        lb = amat.sort_values("Cured Balance", ascending=False).reset_index(drop=True)
+        lb.insert(0, "Rank", lb.index + 1)
+        st.dataframe(
+            lb[["Rank", "Agent", "Cured Balance", "Cured Accounts", "Cure %"]].head(15)
+            .style.format({"Cured Balance": PHP, "Cure %": "{:.1f}%"}),
+            use_container_width=True, hide_index=True,
+        )
+    with lb_tabs[4]:
+        lb = amat.sort_values("Cure %", ascending=False).reset_index(drop=True)
+        lb.insert(0, "Rank", lb.index + 1)
+        st.dataframe(
+            lb[["Rank", "Agent", "Cure %", "Cured Accounts", "Endorsed Accounts"]].head(15)
+            .style.format({"Cure %": "{:.1f}%"}),
+            use_container_width=True, hide_index=True,
+        )
+
+    st.markdown("### 💚 Cured Accounts & Balance by Agent")
+    cure_agent = cure_summary_by(filtered, "agent", "Agent").head(20)
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(cure_agent.sort_values("Cured Accounts"), x="Cured Accounts", y="Agent",
+                     orientation="h", title="Cured Accounts by Agent (Top 20)",
+                     color="Cured Accounts", color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_23")
+    with c2:
+        fig = px.bar(cure_agent.sort_values("Cured Balance"), x="Cured Balance", y="Agent",
+                     orientation="h", title="Cured Balance by Agent (Top 20)",
+                     color="Cured Balance", color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_24")
+
+# ============================================================================
+# TAB 4 — TELE & FIELD RESULTS DASHBOARD
+# ============================================================================
+
+with tabs[3]:
+    st.subheader("Tele & Field Results Dashboard")
+
+    st.markdown("### 📞 Tele Result (SubStatus)")
+    tele_matrix = full_status_matrix(filtered, "substatus", "Tele Result")
+    money_cols = [c for c in tele_matrix.columns if "Balance" in c]
+    st.dataframe(
+        tele_matrix.style.format({c: PHP for c in money_cols}),
+        use_container_width=True, hide_index=True, height=380,
+    )
+    tele_body = tele_matrix[tele_matrix["Tele Result"] != "TOTAL"]
+
+    st.markdown("### 🚶 Field Result (Fv_Result)")
+    field_matrix = full_status_matrix(filtered, "fv_result", "Field Result")
+    money_cols = [c for c in field_matrix.columns if "Balance" in c]
+    st.dataframe(
+        field_matrix.style.format({c: PHP for c in money_cols}),
+        use_container_width=True, hide_index=True, height=460,
+    )
+    field_body = field_matrix[field_matrix["Field Result"] != "TOTAL"]
+
+    # ---- Total of Visits Made ----
+    st.markdown("### 🚗 Field Visit Volume (Total of Visits Made)")
+    visits_acc = distinct_accounts(filtered)
+    total_visits = visits_acc["total_visits"].sum()
+    avg_visits = visits_acc["total_visits"].mean()
+    r1 = st.columns(2)
+    r1[0].metric("Total Visits", fnum(total_visits))
+    r1[1].metric("Average Visits per Account", f"{avg_visits:.2f}" if pd.notna(avg_visits) else "0.00")
+
+    visits_per_result = filtered.dropna(subset=["fv_result"])
+    visits_per_result = visits_per_result[visits_per_result["fv_result"] != "Unspecified"]
+    vpr = distinct_accounts(visits_per_result).groupby("fv_result").agg(
+        Total_Visits=("total_visits", "sum"), Avg_Visits=("total_visits", "mean"),
+        Accounts=("concat", "nunique"),
+    ).reset_index().rename(columns={"fv_result": "Field Result", "Total_Visits": "Total Visits",
+                                     "Avg_Visits": "Average Visits"})
+    vpr = vpr.sort_values("Total Visits", ascending=False)
+    st.dataframe(vpr.style.format({"Average Visits": "{:.2f}"}), use_container_width=True, hide_index=True)
+
+    st.markdown("### 📊 Visualizations")
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.pie(tele_body, names="Tele Result", values="Total Count", hole=0.4,
+                     title="Tele Result Distribution", color_discrete_sequence=BLUES_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_25")
+    with c2:
+        fig = px.pie(field_body.sort_values("Total Count", ascending=False).head(12),
+                     names="Field Result", values="Total Count", hole=0.4,
+                     title="Field Result Distribution (Top 12)", color_discrete_sequence=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_26")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        m = tele_body[["Tele Result", "Active Count", "Cured Count", "Flowed Count"]].melt(
+            id_vars="Tele Result", value_vars=["Active Count", "Cured Count", "Flowed Count"],
+            var_name="Status", value_name="Accounts",
+        )
+        m["Status"] = m["Status"].str.replace(" Count", "")
+        fig = px.bar(m.sort_values("Accounts"), x="Accounts", y="Tele Result", color="Status",
+                     orientation="h", barmode="stack", color_discrete_map=STATUS_COLORS,
+                     title="Tele Result vs Status")
+        fig.update_layout(height=450)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_27")
+    with c2:
+        top_field = field_body.sort_values("Total Count", ascending=False).head(15)["Field Result"]
+        m = field_body[field_body["Field Result"].isin(top_field)][
+            ["Field Result", "Active Count", "Cured Count", "Flowed Count"]].melt(
+            id_vars="Field Result", value_vars=["Active Count", "Cured Count", "Flowed Count"],
+            var_name="Status", value_name="Accounts",
+        )
+        m["Status"] = m["Status"].str.replace(" Count", "")
+        fig = px.bar(m.sort_values("Accounts"), x="Accounts", y="Field Result", color="Status",
+                     orientation="h", barmode="stack", color_discrete_map=STATUS_COLORS,
+                     title="Field Result vs Status (Top 15)")
+        fig.update_layout(height=450)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_28")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(vpr.head(15), x="Field Result", y="Average Visits",
+                     title="Total Visit Analysis — Average Visits per Field Result",
+                     color="Average Visits", color_continuous_scale=BLUES_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_29")
+    with c2:
+        top_ob = pd.concat([
+            tele_body.rename(columns={"Tele Result": "Result"})[["Result", "Total Balance"]].assign(Type="Tele"),
+            field_body.rename(columns={"Field Result": "Result"})[["Result", "Total Balance"]].assign(Type="Field"),
+        ]).sort_values("Total Balance", ascending=False).head(15)
+        fig = px.bar(top_ob.sort_values("Total Balance"), x="Total Balance", y="Result", color="Type",
+                     orientation="h", title="Top Results by OB (Tele + Field)",
+                     color_discrete_map={"Tele": SB_BLUE, "Field": SB_GREEN})
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_30")
+
+# ============================================================================
+# TAB 5 — AREA DASHBOARD
+# ============================================================================
+
+with tabs[4]:
+    st.subheader("Area Performance")
+    area_mat = full_status_matrix(filtered, "area", "AREA")
+    area_mat["Cure Rate %"] = np.where(
+        area_mat["Total Count"] > 0, area_mat["Cured Count"] / area_mat["Total Count"] * 100, 0
+    )
+    money_cols = [c for c in area_mat.columns if "Balance" in c]
+    st.dataframe(
+        area_mat.style.format({**{c: PHP for c in money_cols}, "Cure Rate %": "{:.1f}%"}),
+        use_container_width=True, hide_index=True, height=380,
+    )
+    area_body = area_mat[area_mat["AREA"] != "TOTAL"]
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(area_body.sort_values("Total Balance"), x="Total Balance", y="AREA",
+                     orientation="h", title="Area Ranking by Balance", color="Total Balance",
+                     color_continuous_scale=BLUES_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_31")
+    with c2:
+        m = area_body[["AREA", "Active Count", "Cured Count", "Flowed Count"]].melt(
+            id_vars="AREA", value_vars=["Active Count", "Cured Count", "Flowed Count"],
+            var_name="Status", value_name="Accounts",
+        )
+        m["Status"] = m["Status"].str.replace(" Count", "")
+        fig = px.bar(m, x="AREA", y="Accounts", color="Status", barmode="stack",
+                     color_discrete_map=STATUS_COLORS, title="Area Status Breakdown")
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_32")
+
+    fig = px.treemap(area_body, path=["AREA"], values="Total Balance",
+                      color="Total Balance", color_continuous_scale=BLUES_SCALE,
+                      title="Area Treemap (by Balance)")
+    st.plotly_chart(fig, use_container_width=True, key=f"chart_33")
+
+    st.markdown("### 🔵🟢 Area Break — NCR vs Universal")
+    st.caption("Area Break grouping is sourced from the **Area List** column (falling back to Area, then Area2, if Area List has no NCR/Universal matches).")
+    a_list = filtered.copy()
+    a_list["area_group"] = a_list["area_list"].apply(
+        lambda v: "NCR" if "ncr" in str(v).lower()
+        else ("Universal" if "univ" in str(v).lower() else None)
+    )
+    a2 = filtered.copy()
+    a2["area_group"] = a2["area"].apply(
+        lambda v: "NCR" if "ncr" in str(v).lower()
+        else ("Universal" if "univ" in str(v).lower() else None)
+    )
+    a2_fallback = filtered.copy()
+    a2_fallback["area_group"] = a2_fallback["area2"].apply(
+        lambda v: "NCR" if "ncr" in str(v).lower()
+        else ("Universal" if "univ" in str(v).lower() else None)
+    )
+    grp = a_list[a_list["area_group"].notna()]
+    if grp.empty:
+        grp = a2[a2["area_group"].notna()]
+    if grp.empty:
+        grp = a2_fallback[a2_fallback["area_group"].notna()]
+
+    if not grp.empty:
+        rows = []
+        for name, g in grp.groupby("area_group"):
+            acc_g = distinct_accounts(g)
+            row = {"Area Break": name, "Total Accounts": acc_g["concat"].nunique(),
+                   "Total Balance": acc_g["ob_tad"].sum()}
+            for st_name in ["Active", "Flowed", "Cured"]:
+                s = acc_g[acc_g["status_norm"] == st_name]
+                row[f"{st_name} Accounts"] = s["concat"].nunique()
+                row[f"{st_name} Balance"] = s["ob_tad"].sum()
+            rows.append(row)
+        comp = pd.DataFrame(rows)
+        money_cols = [c for c in comp.columns if "Balance" in c]
+        st.dataframe(comp.style.format({c: PHP for c in money_cols}),
+                     use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            m = comp[["Area Break", "Active Accounts", "Flowed Accounts", "Cured Accounts"]].melt(
+                id_vars="Area Break",
+                value_vars=["Active Accounts", "Flowed Accounts", "Cured Accounts"],
+                var_name="Status", value_name="Accounts",
+            )
+            m["Status"] = m["Status"].str.replace(" Accounts", "")
+            fig = px.bar(m, x="Area Break", y="Accounts", color="Status", barmode="group",
+                         color_discrete_map=STATUS_COLORS, title="NCR vs Universal — Accounts")
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_34")
+        with c2:
+            m = comp[["Area Break", "Active Balance", "Flowed Balance", "Cured Balance"]].melt(
+                id_vars="Area Break",
+                value_vars=["Active Balance", "Flowed Balance", "Cured Balance"],
+                var_name="Status", value_name="Balance",
+            )
+            m["Status"] = m["Status"].str.replace(" Balance", "")
+            fig = px.bar(m, x="Area Break", y="Balance", color="Status", barmode="group",
+                         color_discrete_map=STATUS_COLORS, title="NCR vs Universal — Balance")
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_35")
+    else:
+        st.info("No records found tagged as NCR or Universal in the Area List, Area, or Area2 columns.")
+
+    st.markdown("### Provincial / Sub-Area Breakdown")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Active Areas**")
+        prov_active = summarize_by(filtered[filtered["status_norm"] == "Active"], "sub_area")
+        prov_active = prov_active.rename(columns={"sub_area": "Province"})[["Province", "Accounts", "Balance"]]
+        total_row = pd.DataFrame([{"Province": "TOTAL", "Accounts": prov_active["Accounts"].sum(),
+                                    "Balance": prov_active["Balance"].sum()}])
+        st.dataframe(pd.concat([prov_active, total_row], ignore_index=True)
+                     .style.format({"Balance": PHP}), use_container_width=True, hide_index=True, height=350)
+    with c2:
+        st.markdown("**Flowed Areas**")
+        prov_flowed = summarize_by(filtered[filtered["status_norm"] == "Flowed"], "sub_area")
+        prov_flowed = prov_flowed.rename(columns={"sub_area": "Province"})[["Province", "Accounts", "Balance"]]
+        total_row = pd.DataFrame([{"Province": "TOTAL", "Accounts": prov_flowed["Accounts"].sum(),
+                                    "Balance": prov_flowed["Balance"].sum()}])
+        st.dataframe(pd.concat([prov_flowed, total_row], ignore_index=True)
+                     .style.format({"Balance": PHP}), use_container_width=True, hide_index=True, height=350)
+
+    st.markdown("### 💚 Cured Accounts & Balance by Area")
+    cure_area = cure_summary_by(filtered, "area", "AREA")
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(cure_area.sort_values("Cured Accounts"), x="Cured Accounts", y="AREA",
+                     orientation="h", title="Cured Accounts by Area", color="Cured Accounts",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_36")
+    with c2:
+        fig = px.bar(cure_area.sort_values("Cured Balance"), x="Cured Balance", y="AREA",
+                     orientation="h", title="Cured Balance by Area", color="Cured Balance",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_37")
+
+# ============================================================================
+# TAB 6 — AREA MAP DASHBOARD (Area List)
+# ============================================================================
+
+with tabs[5]:
+    st.subheader("Area Map Dashboard")
+    st.caption("Geographic view based on the **Area List** column, aggregated to Philippine province/region centroids.")
+
+    map_summary = full_status_matrix(filtered, "area_list", "Area List")
+    map_body = map_summary[map_summary["Area List"] != "TOTAL"].copy()
+
+    if map_body.empty:
+        st.info("No usable Area List values found in the current filter selection.")
+    else:
+        coords = map_body["Area List"].apply(geocode_area)
+        map_body["lat"] = coords.apply(lambda c: c[0] if c else np.nan)
+        map_body["lon"] = coords.apply(lambda c: c[1] if c else np.nan)
+        map_body["Cure Rate %"] = np.where(
+            map_body["Total Count"] > 0, map_body["Cured Count"] / map_body["Total Count"] * 100, 0
+        )
+
+        mapped = map_body.dropna(subset=["lat", "lon"])
+        unmapped = map_body[map_body["lat"].isna()]
+
+        r1 = st.columns(3)
+        r1[0].metric("Area List Values", fnum(len(map_body)))
+        r1[1].metric("Mapped to Coordinates", fnum(len(mapped)))
+        r1[2].metric("Unmapped Labels", fnum(len(unmapped)))
+
+        if not mapped.empty:
+            metric_choice = st.radio(
+                "Bubble size represents:", ["Total Accounts", "Total Balance", "Cure Rate %"],
+                horizontal=True, key="map_metric_choice",
+            )
+            size_col = {"Total Accounts": "Total Count", "Total Balance": "Total Balance",
+                        "Cure Rate %": "Cure Rate %"}[metric_choice]
+
+            scatter_fn = px.scatter_map if hasattr(px, "scatter_map") else px.scatter_mapbox
+            map_style_kwarg = "map_style" if hasattr(px, "scatter_map") else "mapbox_style"
+            fig = scatter_fn(
+                mapped, lat="lat", lon="lon", size=size_col, color="Cure Rate %",
+                color_continuous_scale=GREENS_SCALE, size_max=45, zoom=4.4,
+                hover_name="Area List",
+                hover_data={"Total Count": True, "Total Balance": ":,.2f", "Cured Count": True,
+                            "Active Count": True, "Flowed Count": True, "Cure Rate %": ":.1f",
+                            "lat": False, "lon": False},
+                title="Area List — Portfolio Map (Philippines)",
+            )
+            fig.update_layout(**{map_style_kwarg: "open-street-map"}, height=560,
+                               margin={"r": 0, "t": 40, "l": 0, "b": 0})
+            st.plotly_chart(fig, use_container_width=True, key="chart_map_1")
+        else:
+            st.info("None of the Area List values could be matched to a known Philippine province/region.")
+
+        st.markdown("### Area List — Full Matrix")
+        money_cols = [c for c in map_body.columns if "Balance" in c]
+        st.dataframe(
+            map_body.drop(columns=["lat", "lon"]).style.format(
+                {**{c: PHP for c in money_cols}, "Cure Rate %": "{:.1f}%"}),
+            use_container_width=True, hide_index=True, height=380,
+        )
+
+        if not unmapped.empty:
+            with st.expander(f"⚠️ {len(unmapped)} Area List label(s) could not be matched to a map location"):
+                st.dataframe(unmapped[["Area List", "Total Count", "Total Balance"]]
+                             .style.format({"Total Balance": PHP}), use_container_width=True, hide_index=True)
+                st.caption("These are still included in every other dashboard/table — they're only excluded from the map bubbles above.")
+
+# ============================================================================
+# TAB 7 — ACTIVE STATUS DASHBOARD (Status = Active only)
+# ============================================================================
+
+with tabs[6]:
+    st.subheader("Active Status Dashboard")
+    st.caption("This dashboard is scoped to **Status = Active** accounts only, regardless of the Status filter above.")
+
+    active_only = filtered[filtered["status_norm"] == "Active"]
+
+    if active_only.empty:
+        st.info("No Active-status records in the current filter selection.")
+    else:
+        active_acc_ct = distinct_accounts(active_only)["concat"].nunique()
+        active_bal_ct = distinct_accounts(active_only)["ob_tad"].sum()
+        r1 = st.columns(2)
+        r1[0].metric("Active Accounts", fnum(active_acc_ct))
+        r1[1].metric("Active Balance", PHP(active_bal_ct))
+
+        st.markdown("### A. Active Status (from `active` column)")
+        act_sum = summarize_by(active_only, "active").rename(columns={"active": "Active Status"})
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = px.pie(act_sum, names="Active Status", values="Accounts", hole=0.5,
+                         title="Active Status — Donut", color_discrete_sequence=BLUES_SCALE)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_38")
+        with c2:
+            fig = px.bar(act_sum.sort_values("Accounts"), x="Accounts", y="Active Status",
+                         orientation="h", title="Active Status Breakdown", color="Accounts",
+                         color_continuous_scale=BLUES_SCALE)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_39")
+        st.dataframe(act_sum[["Active Status", "Accounts", "Balance"]].rename(
+            columns={"Accounts": "Count"}).style.format({"Balance": PHP}),
+            use_container_width=True, hide_index=True)
+
+        st.markdown("### B. Tele Result (from SubStatus)")
+        tele_sum = summarize_by(active_only, "substatus").rename(columns={"substatus": "Tele Result"})
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = px.bar(tele_sum.sort_values("Accounts"), x="Accounts", y="Tele Result",
+                         orientation="h", title="Tele Result Breakdown (Active)", color="Accounts",
+                         color_continuous_scale=BLUES_SCALE)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_40")
+        with c2:
+            st.dataframe(tele_sum[["Tele Result", "Accounts", "Balance"]].rename(
+                columns={"Accounts": "Count"}).style.format({"Balance": PHP}),
+                use_container_width=True, hide_index=True, height=380)
+
+        st.markdown("### C. Field Result (from Fv_Result)")
+        field_sum = summarize_by(active_only, "fv_result").rename(columns={"fv_result": "Field Result"})
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = px.bar(field_sum.sort_values("Accounts"), x="Accounts", y="Field Result",
+                         orientation="h", title="Field Result Breakdown (Active)", color="Accounts",
+                         color_continuous_scale=GREENS_SCALE)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_41")
+        with c2:
+            st.dataframe(field_sum[["Field Result", "Accounts", "Balance"]].rename(
+                columns={"Accounts": "Count"}).style.format({"Balance": PHP}),
+                use_container_width=True, hide_index=True, height=380)
+
+        st.markdown("### 🔥 Tele Result × Field Result Heatmap")
+        heat_df = active_only.dropna(subset=["substatus", "fv_result"])
+        heat_df = heat_df[(heat_df["substatus"] != "Unspecified") & (heat_df["fv_result"] != "Unspecified")]
+        if not heat_df.empty:
+            heat_acc = distinct_accounts(heat_df)
+            pivot = heat_acc.pivot_table(index="substatus", columns="fv_result", values="concat",
+                                          aggfunc="nunique", fill_value=0)
+            top_rows = pivot.sum(axis=1).sort_values(ascending=False).head(12).index
+            top_cols = pivot.sum(axis=0).sort_values(ascending=False).head(12).index
+            pivot = pivot.loc[top_rows, top_cols]
+            fig = px.imshow(pivot, text_auto=True, color_continuous_scale=BLUES_SCALE,
+                             title="Tele Result × Field Result Heatmap (Active, Top Categories)",
+                             aspect="auto", labels=dict(x="Field Result", y="Tele Result", color="Accounts"))
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_42")
+        else:
+            st.info("Not enough Tele Result / Field Result data to build the heatmap.")
+
+# ============================================================================
+# TAB 8 — CURED / PAYMENT DASHBOARD
+# ============================================================================
+
+with tabs[7]:
+    st.subheader("Cured / Payment Dashboard")
+    st.caption("Accounts with **Status = CURED** are treated as paid/cured accounts throughout this section.")
+
+    acc = distinct_accounts(filtered)
+    total_accounts = acc["concat"].nunique()
+    total_balance = acc["ob_tad"].sum()
+    cured_acc_df = acc[acc["status_norm"] == "Cured"]
+    cured_accounts = cured_acc_df["concat"].nunique()
+    cured_balance = cured_acc_df["ob_tad"].sum()
+    cure_rate = (cured_accounts / total_accounts * 100) if total_accounts else 0
+    cure_bal_rate = (cured_balance / total_balance * 100) if total_balance else 0
+
+    r1 = st.columns(4)
+    r1[0].metric("Total Cured Accounts", fnum(cured_accounts))
+    r1[1].metric("Total Cured Balance", PHP(cured_balance))
+    r1[2].metric("Cure Rate", pct(cure_rate))
+    r1[3].metric("Cure Balance Rate", pct(cure_bal_rate))
+
+    st.markdown("### Cured Analysis by Industry")
+    cure_ind = cure_summary_by(filtered, "industry", "Industry")
+    st.dataframe(
+        cure_ind.style.format({"Cured Balance": PHP, "Cure Rate %": "{:.1f}%"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    st.markdown("### Cured Analysis by Agent")
+    cure_agent = cure_summary_by(filtered, "agent", "Agent")
+    st.dataframe(
+        cure_agent.style.format({"Cured Balance": PHP, "Cure Rate %": "{:.1f}%"}),
+        use_container_width=True, hide_index=True, height=350,
+    )
+
+    st.markdown("### Cured Analysis by Area")
+    cure_area = cure_summary_by(filtered, "area", "AREA")
+    st.dataframe(
+        cure_area.style.format({"Cured Balance": PHP, "Cure Rate %": "{:.1f}%"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    st.markdown("### 💚 Cured Accounts & Balance — Consolidated Charts")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        fig = px.bar(cure_ind.sort_values("Cured Accounts"), x="Cured Accounts", y="Industry",
+                     orientation="h", title="Cured Accounts by Industry", color="Cured Accounts",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_43")
+    with c2:
+        fig = px.bar(cure_agent.sort_values("Cured Accounts").tail(15), x="Cured Accounts", y="Agent",
+                     orientation="h", title="Cured Accounts by Agent (Top 15)", color="Cured Accounts",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_44")
+    with c3:
+        fig = px.bar(cure_area.sort_values("Cured Accounts"), x="Cured Accounts", y="AREA",
+                     orientation="h", title="Cured Accounts by Area", color="Cured Accounts",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_45")
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        fig = px.bar(cure_ind.sort_values("Cured Balance"), x="Cured Balance", y="Industry",
+                     orientation="h", title="Cured Balance by Industry", color="Cured Balance",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_46")
+    with c5:
+        fig = px.bar(cure_agent.sort_values("Cured Balance").tail(15), x="Cured Balance", y="Agent",
+                     orientation="h", title="Cured Balance by Agent (Top 15)", color="Cured Balance",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_47")
+    with c6:
+        fig = px.bar(cure_area.sort_values("Cured Balance"), x="Cured Balance", y="AREA",
+                     orientation="h", title="Cured Balance by Area", color="Cured Balance",
+                     color_continuous_scale=GREENS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_48")
+
+    if filtered["action_date"].notna().any():
+        st.markdown("### Cure Trend Over Time")
+        trend = filtered.dropna(subset=["action_date"]).copy()
+        trend["Month"] = trend["action_date"].dt.to_period("M").astype(str)
+        cure_trend = trend[trend["status_norm"] == "Cured"].drop_duplicates(subset=["concat", "Month"]) \
+            .groupby("Month").agg(Accounts=("concat", "nunique"), Balance=("ob_tad", "sum")).reset_index()
+        c1, c2 = st.columns(2)
+        with c1:
+            fig = px.line(cure_trend, x="Month", y="Accounts", markers=True,
+                          title="Cured Accounts Trend (Monthly)", color_discrete_sequence=[SB_GREEN])
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_49")
+        with c2:
+            fig = px.line(cure_trend, x="Month", y="Balance", markers=True,
+                          title="Cured Balance Trend (Monthly)", color_discrete_sequence=[SB_GREEN])
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_50")
+
+# ============================================================================
+# TAB 9 — ACCOUNT DETAILS
+# ============================================================================
+
+with tabs[8]:
+    st.subheader("Account Detail View")
+    detail_cols = {
+        "concat": "Account Number", "account_name": "Account Name", "industry": "Industry",
+        "agent": "Agent", "ob_tad": "OB", "status": "Status", "substatus": "Tele Results",
+        "fv_result": "FV Result", "area": "Area", "area_list": "Area Break",
+        "endorsement_date": "Date Endorsed",
+    }
+    detail = distinct_accounts(filtered)[list(detail_cols.keys())].rename(columns=detail_cols)
+    detail["Date Endorsed"] = detail["Date Endorsed"].apply(
+        lambda d: d.strftime("%m/%d/%Y") if pd.notna(d) else ""
+    )
+    st.caption(f"{len(detail):,} distinct accounts")
+
+    if HAS_AGGRID:
+        gb = GridOptionsBuilder.from_dataframe(detail)
+        gb.configure_default_column(filterable=True, sortable=True, resizable=True)
+        gb.configure_pagination(paginationAutoPageSize=False, paginationPageSize=25)
+        gb.configure_side_bar()
+        AgGrid(detail, gridOptions=gb.build(), update_mode=GridUpdateMode.NO_UPDATE,
+               theme="balham", height=480, fit_columns_on_grid_load=True)
+    else:
+        st.dataframe(detail, use_container_width=True, height=480)
+        st.caption("Install `streamlit-aggrid` for advanced search/sort/filter grid features.")
+
+    st.download_button(
+        "⬇️ Export Account Details (Excel)",
+        data=to_excel_bytes({"Account Details": detail}),
+        file_name="account_details.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+# ============================================================================
+# TAB 10 — DOWNLOADS
+# ============================================================================
+
+with tabs[9]:
+    st.subheader("Export Center")
+    st.caption("All exports reflect the currently applied filters and include Security Bank-themed styling.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        summary_sheets = {
+            "Executive Summary": status_summary(filtered),
+            "Industry": full_status_matrix(filtered, "industry", "INDUSTRY"),
+            "Agent": agent_matrix(filtered),
+        }
+        st.download_button("⬇️ Download Dashboard Summary", to_excel_bytes(summary_sheets),
+                            "dashboard_summary.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        st.download_button("⬇️ Download Industry Report",
+                            to_excel_bytes({"Industry": full_status_matrix(filtered, "industry", "INDUSTRY")}),
+                            "industry_report.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        area_sheets = {
+            "Area": full_status_matrix(filtered, "area", "AREA"),
+            "Area Break (Area List)": summarize_by(filtered, "area_list"),
+            "Sub Area": summarize_by(filtered, "sub_area"),
+        }
+        st.download_button("⬇️ Download Area Report", to_excel_bytes(area_sheets),
+                            "area_report.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with c2:
+        st.download_button("⬇️ Download Agent Performance",
+                            to_excel_bytes({"Agent": agent_matrix(filtered)}),
+                            "agent_performance.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        tele_field_sheets = {
+            "Tele Result": full_status_matrix(filtered, "substatus", "Tele Result"),
+            "Field Result": full_status_matrix(filtered, "fv_result", "Field Result"),
+        }
+        st.download_button("⬇️ Download Tele & Field Results Report", to_excel_bytes(tele_field_sheets),
+                            "tele_field_results_report.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        cured_sheets = {
+            "Cured by Industry": cure_summary_by(filtered, "industry", "Industry"),
+            "Cured by Agent": cure_summary_by(filtered, "agent", "Agent"),
+            "Cured by Area": cure_summary_by(filtered, "area", "AREA"),
+        }
+        st.download_button("⬇️ Download Cured/Payment Report", to_excel_bytes(cured_sheets),
+                            "cured_payment_report.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        exec_sheets = {
+            "BOM-FRESH": summarize_by(filtered, "bom_fresh"),
+            "Balance Distribution": full_status_matrix(filtered, "bal_distro", "BAL Distro"),
+        }
+        st.download_button("⬇️ Download Executive (BOM/FRESH & Balance Distro) Report",
+                            to_excel_bytes(exec_sheets), "executive_bom_fresh_baldistro.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        st.download_button("⬇️ Download Raw (Filtered) Data",
+                            to_excel_bytes({"Raw Data": filtered.drop(columns=["status_norm", "has_payment"])}),
+                            "raw_data_filtered.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.markdown("---")
+st.caption("SBC B2 BEL Collection Dashboard · Security Bank · Banking-grade curing & portfolio performance analytics")
