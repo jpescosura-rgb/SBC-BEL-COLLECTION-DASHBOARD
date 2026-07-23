@@ -10,6 +10,7 @@ Run with:
 
 import io
 import re
+import unicodedata
 from datetime import datetime
 
 import numpy as np
@@ -91,25 +92,39 @@ footer:after {{content:''; visibility: hidden;}}
 
 /* ---- Sidebar ---- */
 section[data-testid="stSidebar"] {{
-    background: linear-gradient(180deg, {SB_DARK_BLUE} 0%, {SB_BLUE} 100%);
+    background: linear-gradient(180deg, {SB_LIGHT_BLUE} 0%, #CFE4FB 100%);
+    border-right: 1px solid #B9D4F2;
 }}
-section[data-testid="stSidebar"] * {{ color: #EAF3FF !important; }}
+section[data-testid="stSidebar"] * {{ color: {SB_DARK_BLUE} !important; }}
+section[data-testid="stSidebar"] h1, section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {{ color: {SB_DARK_BLUE} !important; font-weight: 800 !important; }}
 section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] {{
-    background-color: {SB_WHITE} !important;
+    background-color: {SB_BLUE} !important;
 }}
 section[data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] span {{
-    color: {SB_DARK_BLUE} !important;
+    color: {SB_WHITE} !important;
 }}
 section[data-testid="stSidebar"] div[data-baseweb="select"] > div {{
-    background-color: rgba(255,255,255,0.12);
+    background-color: {SB_WHITE};
+    border: 1px solid #B9D4F2;
     border-radius: 8px;
 }}
 section[data-testid="stSidebar"] button {{
-    background-color: {SB_WHITE} !important;
-    color: {SB_DARK_BLUE} !important;
+    background-color: {SB_BLUE} !important;
+    color: {SB_WHITE} !important;
     border-radius: 8px !important;
     font-weight: 600 !important;
     border: none !important;
+}}
+section[data-testid="stSidebar"] div[data-testid="stFileUploaderDropzone"] {{
+    background-color: {SB_WHITE};
+    border: 1px dashed #8FB8E8;
+    border-radius: 10px;
+}}
+section[data-testid="stSidebar"] div[data-testid="stExpander"] {{
+    background-color: {SB_WHITE};
+    border-radius: 10px;
+    border: 1px solid #B9D4F2;
 }}
 
 /* ---- KPI cards ---- */
@@ -175,6 +190,41 @@ def pct(v):
     return f"{v:.1f}%"
 
 
+def traffic_light_color(value, good=70, warn=40, higher_is_better=True):
+    """Return a Security Bank brand color (green/amber/red) for a rate value against
+    default performance thresholds. Thresholds are reasonable defaults, not audited
+    targets, and can be adjusted per metric via the good/warn parameters."""
+    if value is None or pd.isna(value):
+        return SB_ORANGE
+    if higher_is_better:
+        if value >= good:
+            return SB_GREEN
+        if value >= warn:
+            return SB_ORANGE
+        return SB_RED
+    else:
+        if value <= warn:
+            return SB_GREEN
+        if value <= good:
+            return SB_ORANGE
+        return SB_RED
+
+
+def render_rate_metric(col, label, value_str, rate_for_color, good=70, warn=40,
+                        higher_is_better=True, help_text=None):
+    """Render an st.metric plus a thin colored performance bar underneath it
+    (green/amber/red) based on traffic_light_color. Use for rate-based KPIs
+    where a target/threshold is meaningful; use plain st.metric for raw counts."""
+    with col:
+        col.metric(label, value_str, help=help_text)
+        color = traffic_light_color(rate_for_color, good=good, warn=warn, higher_is_better=higher_is_better)
+        st.markdown(
+            f'<div style="height:6px;border-radius:3px;background:{color};'
+            f'margin-top:-10px;margin-bottom:6px;"></div>',
+            unsafe_allow_html=True,
+        )
+
+
 # ============================================================================
 # COLUMN RESOLUTION
 # ============================================================================
@@ -203,6 +253,9 @@ COLUMN_ALIASES = {
     "risk_level": ["risk level", "risk lvl", "bom/fresh", "bom fresh"],
     "bal_distro": ["bal distro", "balance distro", "bal distribution"],
     "total_visits": ["total of visits made", "total visits", "visits made"],
+    "ptp_date": ["ptp-date", "ptp date", "ptp_date", "promise to pay date"],
+    "ptp_amount": ["ptp-amount", "ptp amount", "ptp_amount", "promise to pay amount"],
+    "bp_flag": ["bp?", "bp", "broken promise"],
 }
 
 REQUIRED_MIN = ["concat", "ob_tad", "status"]
@@ -276,12 +329,14 @@ def prepare_data(df: pd.DataFrame):
 
     work["ob_tad"] = clean_numeric(work["ob_tad"])
     work["total_visits"] = clean_numeric(work["total_visits"])
+    work["ptp_amount"] = clean_numeric(work["ptp_amount"])
     work["action_date"] = clean_date(work["action_date"])
     work["endorsement_date"] = clean_date(work["endorsement_date"])
+    work["ptp_date"] = clean_date(work["ptp_date"])
 
     for c in ["status", "substatus", "industry", "agent", "area", "area2",
               "sub_area", "active", "fv_result", "tele_field",
-              "area_list", "cured_flag", "risk_level", "bal_distro"]:
+              "area_list", "cured_flag", "risk_level", "bal_distro", "bp_flag"]:
         work[c] = work[c].astype(str).str.strip()
         work[c] = work[c].replace({"nan": "Unspecified", "": "Unspecified", "None": "Unspecified"})
 
@@ -300,6 +355,28 @@ def prepare_data(df: pd.DataFrame):
         return v
 
     work["bom_fresh"] = work["risk_level"].apply(_bom_fresh)
+
+    # ---- PTP validity: a record only counts as a PTP when PTP Date is present ----
+    work["is_valid_ptp"] = work["ptp_date"].notna()
+
+    # ---- BP (Broken Promise) enhanced identification ----
+    # 1) Trust an explicit Yes/True-style value already present in the "BP?" column.
+    def _norm_yes(v):
+        return str(v).strip().lower() in ("yes", "y", "true", "1", "bp", "broken", "broken promise")
+
+    work["bp_raw_flag"] = work["bp_flag"].apply(_norm_yes)
+
+    # 2) Backstop with computed logic: a valid PTP whose promised date has already
+    #    lapsed (relative to the most recent Action Date in this extract, used as
+    #    the "as of" reference point) with no cure recorded is also a broken promise.
+    reference_date = work["action_date"].max() if work["action_date"].notna().any() else pd.Timestamp.now().normalize()
+    work["ptp_lapsed"] = (
+        work["is_valid_ptp"]
+        & (work["ptp_date"] < reference_date)
+        & (work["status_norm"] != "Cured")
+    )
+    work["is_bp"] = work["is_valid_ptp"] & (work["bp_raw_flag"] | work["ptp_lapsed"])
+    work["bp_status"] = np.where(work["is_bp"], "Yes", "No")
 
     return work, mapping, missing
 
@@ -413,6 +490,48 @@ def agent_matrix(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("Endorsed Balance", ascending=False)
 
 
+def agent_ptp_bp_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-agent PTP (valid PTP Date only), BP, and Cured summary, with conversion rates:
+    - PTP-to-Cured Conversion Rate % = Cured Count / PTP Count * 100
+    - BP-to-PTP Conversion Rate %    = PTP Count / BP Count * 100  (per spec formula)
+    PTP Accounts/Amount only count records where PTP Date is present."""
+    acc = distinct_accounts(df)
+    rows = []
+    for agent, grp in acc.groupby("agent"):
+        ptp = grp[grp["is_valid_ptp"]]
+        bp = grp[grp["is_bp"]]
+        cured = grp[grp["status_norm"] == "Cured"]
+        ptp_accounts = ptp["concat"].nunique()
+        bp_count = bp["concat"].nunique()
+        cured_count = cured["concat"].nunique()
+        rows.append({
+            "Agent": agent,
+            "Total Visits": grp["total_visits"].sum(),
+            "PTP Accounts": ptp_accounts,
+            "PTP Amount": ptp["ptp_amount"].sum(),
+            "BP Count": bp_count,
+            "BP OB": bp["ob_tad"].sum(),
+            "Cured Count": cured_count,
+            "BP Rate % (of PTP)": (bp_count / ptp_accounts * 100) if ptp_accounts else 0,
+            "PTP-to-Cured Conversion Rate %": (cured_count / ptp_accounts * 100) if ptp_accounts else 0,
+            "BP-to-PTP Conversion Rate %": (ptp_accounts / bp_count * 100) if bp_count else np.nan,
+        })
+    return pd.DataFrame(rows).sort_values("PTP Amount", ascending=False)
+
+
+def bp_summary_by(df: pd.DataFrame, group_col: str, label_name: str) -> pd.DataFrame:
+    """BP Count and BP OB grouped by an arbitrary column, restricted to BP=Yes records."""
+    acc = distinct_accounts(df)
+    acc = acc[acc[group_col] != "Unspecified"] if acc[group_col].dtype == object else acc
+    bp = acc[acc["is_bp"]]
+    if bp.empty:
+        return pd.DataFrame(columns=[label_name, "BP Count", "BP OB"])
+    out = bp.groupby(group_col).agg(
+        **{"BP Count": ("concat", "nunique"), "BP OB": ("ob_tad", "sum")}
+    ).reset_index().rename(columns={group_col: label_name})
+    return out.sort_values("BP OB", ascending=False)
+
+
 # ============================================================================
 # GEO / MAP HELPERS (Philippine provinces, for the Area List map dashboard)
 # ============================================================================
@@ -452,7 +571,10 @@ PH_PROVINCE_COORDS = {
     "NUEVA ECIJA": (15.5784, 121.0687), "NUEVA VIZCAYA": (16.3301, 121.1710),
     "OCCIDENTAL MINDORO": (13.1024, 120.7651), "ORIENTAL MINDORO": (13.0565, 121.4069),
     "PALAWAN": (9.8349, 118.7384), "PAMPANGA": (15.0794, 120.6200),
-    "PANGASINAN": (15.8949, 120.2863), "QUEZON": (14.0313, 122.1106),
+    "PANGASINAN": (15.8949, 120.2863),
+    "QUEZON": (14.0313, 122.1106),           # Quezon Province
+    "QUEZON PROVINCE": (14.0313, 122.1106),
+    "QUEZON CITY": (14.6760, 121.0437),      # Quezon City (Metro Manila) — kept distinct from Quezon Province
     "QUIRINO": (16.3676, 121.5479), "RIZAL": (14.6037, 121.3084),
     "ROMBLON": (12.5778, 122.2695), "SAMAR": (11.9804, 124.9944),
     "SARANGANI": (5.9591, 125.2228), "SIQUIJOR": (9.1911, 123.5952),
@@ -463,19 +585,39 @@ PH_PROVINCE_COORDS = {
     "TAWI-TAWI": (5.1339, 119.9552), "ZAMBALES": (15.5082, 120.0691),
     "ZAMBOANGA DEL NORTE": (8.1527, 123.2577), "ZAMBOANGA DEL SUR": (7.8383, 123.2984),
     "ZAMBOANGA SIBUGAY": (7.5222, 122.8198),
+    # ---- Additional Metro Manila cities / districts and CAR region ----
+    "PASIG": (14.5764, 121.0851),
+    "CORDILLERA": (16.4023, 120.5960),               # CAR region (Baguio-area centroid)
+    "CORDILLERA ADMINISTRATIVE REGION": (16.4023, 120.5960),
+    "PARANAQUE": (14.4793, 121.0198),
+    "MAKATI": (14.5547, 121.0244),
+    "MARIKINA": (14.6507, 121.1029),
+    "BICUTAN": (14.5027, 121.0509),
+    "TAGUIG": (14.5176, 121.0509),
+    "VALENZUELA CITY": (14.7000, 120.9830),
+    "VALENZUELA": (14.7000, 120.9830),
+    "MALABON": (14.6650, 120.9567),
 }
 
 
+def _strip_accents(text: str) -> str:
+    """Remove accents/diacritics (e.g. ñ -> n) for robust text matching."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+
+
 def geocode_area(name: str):
-    """Best-effort match of a free-text area/province label to PH lat/lon."""
+    """Best-effort match of a free-text area/province/city label to PH lat/lon.
+    Uses exact match first, then longest-name-first substring matching so more
+    specific labels (e.g. 'QUEZON CITY') are preferred over shorter, broader
+    ones (e.g. 'QUEZON') when both could match the input text."""
     if not name or str(name).strip() in ("", "nan", "None", "Unspecified"):
         return None
-    key = re.sub(r"\s+", " ", str(name).strip().upper())
+    key = re.sub(r"\s+", " ", _strip_accents(str(name).strip()).upper())
     if key in PH_PROVINCE_COORDS:
         return PH_PROVINCE_COORDS[key]
-    for province, coords in PH_PROVINCE_COORDS.items():
+    for province in sorted(PH_PROVINCE_COORDS.keys(), key=len, reverse=True):
         if province in key or key in province:
-            return coords
+            return PH_PROVINCE_COORDS[province]
     return None
 
 
@@ -618,6 +760,7 @@ f_active = multiselect_filter("Active Status", "active", "active")
 f_fv = multiselect_filter("Field Result (Fv_Result)", "fv_result", "fv")
 f_product = multiselect_filter("Product Type (Tele/Field)", "tele_field", "product")
 f_riskclass = multiselect_filter("BOM / FRESH", "bom_fresh", "bomfresh")
+f_bp = multiselect_filter("BP (Broken Promise) Status", "bp_status", "bpstatus")
 
 min_end = data["endorsement_date"].min()
 max_end = data["endorsement_date"].max()
@@ -635,6 +778,15 @@ if pd.notna(min_act) and pd.notna(max_act):
     f_act_date = st.sidebar.date_input(
         "Action Date range", value=(min_act.date(), max_act.date()),
         min_value=min_act.date(), max_value=max_act.date(), key="flt_actdate",
+    )
+
+min_ptp = data["ptp_date"].min()
+max_ptp = data["ptp_date"].max()
+f_ptp_date = None
+if pd.notna(min_ptp) and pd.notna(max_ptp):
+    f_ptp_date = st.sidebar.date_input(
+        "PTP Date range", value=(min_ptp.date(), max_ptp.date()),
+        min_value=min_ptp.date(), max_value=max_ptp.date(), key="flt_ptpdate",
     )
 
 filtered = data.copy()
@@ -658,6 +810,8 @@ if f_product:
     filtered = filtered[filtered["tele_field"].isin(f_product)]
 if f_riskclass:
     filtered = filtered[filtered["bom_fresh"].isin(f_riskclass)]
+if f_bp:
+    filtered = filtered[filtered["bp_status"].isin(f_bp)]
 if f_end_date and len(f_end_date) == 2:
     start, end = pd.Timestamp(f_end_date[0]), pd.Timestamp(f_end_date[1])
     filtered = filtered[
@@ -669,6 +823,12 @@ if f_act_date and len(f_act_date) == 2:
     filtered = filtered[
         filtered["action_date"].isna()
         | filtered["action_date"].between(start, end)
+    ]
+if f_ptp_date and len(f_ptp_date) == 2:
+    start, end = pd.Timestamp(f_ptp_date[0]), pd.Timestamp(f_ptp_date[1])
+    filtered = filtered[
+        filtered["ptp_date"].isna()
+        | filtered["ptp_date"].between(start, end)
     ]
 
 if filtered.empty:
@@ -745,9 +905,9 @@ with tabs[0]:
         use_container_width=True, hide_index=True,
     )
 
-    # ---- BOM / FRESH (from Risk Level) ----
+    # ---- BOM / FRESH (renamed from "Risk Level") ----
     st.markdown("---")
-    st.markdown("### 🏷️ BOM / FRESH (Risk Level)")
+    st.markdown("### 🏷️ BOM / FRESH")
     bomfresh = summarize_by(filtered, "bom_fresh").rename(columns={"bom_fresh": "BOM/FRESH"})
     if not bomfresh.empty:
         bom_row = bomfresh[bomfresh["BOM/FRESH"] == "BOM"]
@@ -782,7 +942,7 @@ with tabs[0]:
         st.dataframe(bomfresh.style.format({"Balance": PHP, "Pct of Accounts": "{:.1f}%"}),
                      use_container_width=True, hide_index=True)
     else:
-        st.info("No Risk Level (BOM/FRESH) values detected in this dataset.")
+        st.info("No BOM/FRESH values detected in this dataset.")
 
     # ---- Balance Distribution (BAL Distro) ----
     st.markdown("---")
@@ -823,13 +983,34 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Industry Performance Matrix")
     imat = full_status_matrix(filtered, "industry", "INDUSTRY")
+    body = imat[imat["INDUSTRY"] != "TOTAL"]
+    cure_ind = cure_summary_by(filtered, "industry", "Industry")
+
+    st.markdown("#### 📌 Industry KPIs")
+    if not body.empty and not cure_ind.empty:
+        top_bal_row = body.loc[body["Total Balance"].idxmax()]
+        top_cure_row = cure_ind.loc[cure_ind["Cure Rate %"].idxmax()]
+        low_cure_row = cure_ind.loc[cure_ind["Cure Rate %"].idxmin()]
+        avg_cure_rate = cure_ind["Cure Rate %"].mean()
+        below_avg_count = int((cure_ind["Cure Rate %"] < avg_cure_rate).sum())
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total Industries", fnum(body["INDUSTRY"].nunique()))
+        k2.metric("Top Industry by Balance", top_bal_row["INDUSTRY"], PHP(top_bal_row["Total Balance"]))
+        k3.metric("Best Cure Rate", top_cure_row["Industry"], pct(top_cure_row["Cure Rate %"]))
+        k4.metric("⚠️ Needs Attention (Lowest Cure Rate)", low_cure_row["Industry"],
+                   pct(low_cure_row["Cure Rate %"]), delta_color="inverse")
+        k5.metric("Industries Below Avg Cure Rate", fnum(below_avg_count), f"Avg: {pct(avg_cure_rate)}",
+                   delta_color="off")
+    else:
+        st.info("Not enough Industry data in the current filter selection to compute KPIs.")
+
     money_cols = [c for c in imat.columns if "Balance" in c]
     st.dataframe(
         imat.style.format({c: PHP for c in money_cols}),
         use_container_width=True, hide_index=True, height=420,
     )
 
-    body = imat[imat["INDUSTRY"] != "TOTAL"]
     c1, c2 = st.columns(2)
     with c1:
         fig = px.bar(body.sort_values("Total Balance", ascending=True),
@@ -853,7 +1034,6 @@ with tabs[1]:
     st.plotly_chart(fig, use_container_width=True, key=f"chart_12")
 
     st.markdown("### 💚 Cured Accounts & Balance by Industry")
-    cure_ind = cure_summary_by(filtered, "industry", "Industry")
     c1, c2 = st.columns(2)
     with c1:
         fig = px.bar(cure_ind.sort_values("Cured Accounts"), x="Cured Accounts", y="Industry",
@@ -922,6 +1102,52 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Agent Performance")
     amat = agent_matrix(filtered)
+    ptp_bp_agent = agent_ptp_bp_matrix(filtered)
+
+    st.markdown("#### 📌 Agent KPIs")
+    if not amat.empty:
+        top_bal_row = amat.loc[amat["Endorsed Balance"].idxmax()]
+        top_cure_row = amat.loc[amat["Cure %"].idxmax()]
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total Agents", fnum(amat["Agent"].nunique()))
+        k2.metric("Top Agent by Balance", top_bal_row["Agent"], PHP(top_bal_row["Endorsed Balance"]))
+        k3.metric("Top Agent by Cure Rate", top_cure_row["Agent"], pct(top_cure_row["Cure %"]))
+        if not ptp_bp_agent.empty and ptp_bp_agent["PTP Amount"].sum() > 0:
+            top_ptp_row = ptp_bp_agent.loc[ptp_bp_agent["PTP Amount"].idxmax()]
+            k4.metric("Top Agent by PTP Amount", top_ptp_row["Agent"], PHP(top_ptp_row["PTP Amount"]))
+        else:
+            k4.metric("Top Agent by PTP Amount", "—", "No valid PTPs")
+        if not ptp_bp_agent.empty and ptp_bp_agent["BP Count"].sum() > 0:
+            top_bp_row = ptp_bp_agent.loc[ptp_bp_agent["BP Count"].idxmax()]
+            k5.metric("⚠️ Highest BP Count (Needs Coaching)", top_bp_row["Agent"],
+                       f"{fnum(top_bp_row['BP Count'])} BP", delta_color="inverse")
+        else:
+            k5.metric("⚠️ Highest BP Count (Needs Coaching)", "—", "No BPs", delta_color="off")
+    else:
+        st.info("Not enough Agent data in the current filter selection to compute KPIs.")
+
+    st.markdown("#### 📊 Productivity & Conversion KPIs")
+    agent_acc = distinct_accounts(filtered)
+    total_visits_agent = agent_acc["total_visits"].sum()
+    total_bp = ptp_bp_agent["BP Count"].sum() if not ptp_bp_agent.empty else 0
+    total_ptp = ptp_bp_agent["PTP Accounts"].sum() if not ptp_bp_agent.empty else 0
+    total_cured_agent = ptp_bp_agent["Cured Count"].sum() if not ptp_bp_agent.empty else 0
+    bp_to_ptp_rate = (total_bp / total_ptp * 100) if total_bp else None
+    ptp_to_cured_rate = (total_cured_agent / total_ptp * 100) if total_ptp else 0
+
+    j1, j2, j3, j4 = st.columns(4)
+    j1.metric("Total Visits", fnum(total_visits_agent))
+    j2.metric("BP Count", fnum(total_bp))
+    j3.metric("PTP Count", fnum(total_ptp))
+    j4.metric("Cured Count", fnum(total_cured_agent))
+    j5, j6 = st.columns(2)
+    with j5:
+        st.metric("PTP-to-BP Conversion Rate", pct(bp_to_ptp_rate) if bp_to_ptp_rate is not None else "—",
+                   help="PTP Count ÷ BP Count × 100, per spec formula. Since a Broken Promise "
+                        "requires a valid PTP to exist, this is typically ≥100%.")
+    render_rate_metric(j6, "PTP-to-Cured Conversion Rate", pct(ptp_to_cured_rate), ptp_to_cured_rate,
+                        good=70, warn=40)
+
     money_cols = [c for c in amat.columns if "Balance" in c]
     st.dataframe(
         amat.style.format({**{c: PHP for c in money_cols}, "Cure %": "{:.1f}%"}),
@@ -1006,6 +1232,59 @@ with tabs[2]:
                      color="Cured Balance", color_continuous_scale=GREENS_SCALE)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_24")
 
+    st.markdown("---")
+    st.markdown("### 📅 PTP & BP by Agent")
+    st.caption(
+        "A record only counts as a PTP when **PTP Date** contains a valid value — blank/null "
+        "PTP Dates are excluded from all PTP counts, amounts, and BP calculations below. "
+        "PTP-to-Cured Conversion Rate = Cured Count ÷ PTP Count × 100. "
+        "BP-to-PTP Conversion Rate = PTP Count ÷ BP Count × 100."
+    )
+    ptp_bp_agent = agent_ptp_bp_matrix(filtered)  # already computed above for KPIs; re-shown here for context
+    st.dataframe(
+        ptp_bp_agent.style.format({
+            "Total Visits": "{:,.0f}", "PTP Amount": PHP, "BP OB": PHP,
+            "BP Rate % (of PTP)": "{:.1f}%",
+            "PTP-to-Cured Conversion Rate %": "{:.1f}%",
+            "BP-to-PTP Conversion Rate %": lambda v: "—" if pd.isna(v) else f"{v:.1f}%",
+        }),
+        use_container_width=True, hide_index=True, height=380,
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        top_ptp = ptp_bp_agent.sort_values("PTP Amount", ascending=False).head(20)
+        fig = px.bar(top_ptp.sort_values("PTP Amount"), x="PTP Amount", y="Agent",
+                     orientation="h", title="Top 20 Agents by PTP Amount",
+                     color="PTP Amount", color_continuous_scale=BLUES_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key="chart_agent_ptp_amount")
+    with c2:
+        top_bp = ptp_bp_agent.sort_values("BP Count", ascending=False).head(20)
+        fig = px.bar(top_bp.sort_values("BP Count"), x="BP Count", y="Agent",
+                     orientation="h", title="Top 20 Agents by BP Count",
+                     color="BP Count", color_continuous_scale=REDS_SCALE)
+        st.plotly_chart(fig, use_container_width=True, key="chart_agent_bp_count")
+
+    with st.expander("🔎 Drill down: PTP records for a specific agent"):
+        agent_options = sorted(ptp_bp_agent["Agent"].unique())
+        if agent_options:
+            sel_agent = st.selectbox("Select an Agent", agent_options, key="agent_ptp_drilldown")
+            agent_ptp_rows = distinct_accounts(
+                filtered[(filtered["agent"] == sel_agent) & (filtered["is_valid_ptp"])]
+            )[["concat", "account_name", "action_date", "ptp_date", "ptp_amount", "ob_tad", "bp_status"]].rename(
+                columns={"concat": "Account Number", "account_name": "Account Name",
+                         "action_date": "Action Date", "ptp_date": "PTP Date",
+                         "ptp_amount": "PTP Amount", "ob_tad": "OB", "bp_status": "BP?"}
+            ).sort_values("PTP Date", ascending=False)
+            agent_ptp_rows["Action Date"] = agent_ptp_rows["Action Date"].apply(
+                lambda d: d.strftime("%m/%d/%Y") if pd.notna(d) else "")
+            agent_ptp_rows["PTP Date"] = agent_ptp_rows["PTP Date"].apply(
+                lambda d: d.strftime("%m/%d/%Y") if pd.notna(d) else "")
+            st.dataframe(agent_ptp_rows.style.format({"PTP Amount": PHP, "OB": PHP}),
+                         use_container_width=True, hide_index=True, height=320)
+        else:
+            st.info("No agents with valid PTP records in the current filter selection.")
+
 # ============================================================================
 # TAB 4 — TELE & FIELD RESULTS DASHBOARD
 # ============================================================================
@@ -1013,29 +1292,47 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Tele & Field Results Dashboard")
 
-    st.markdown("### 📞 Tele Result (SubStatus)")
     tele_matrix = full_status_matrix(filtered, "substatus", "Tele Result")
+    tele_body = tele_matrix[tele_matrix["Tele Result"] != "TOTAL"]
+    field_matrix = full_status_matrix(filtered, "fv_result", "Field Result")
+    field_body = field_matrix[field_matrix["Field Result"] != "TOTAL"]
+    visits_acc = distinct_accounts(filtered)
+    total_visits = visits_acc["total_visits"].sum()
+    avg_visits = visits_acc["total_visits"].mean()
+
+    st.markdown("#### 📌 Tele & Field KPIs")
+    if not tele_body.empty and not field_body.empty:
+        top_tele_row = tele_body.loc[tele_body["Total Count"].idxmax()]
+        top_field_row = field_body.loc[field_body["Total Count"].idxmax()]
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Tele Result Categories", fnum(tele_body["Tele Result"].nunique()))
+        k2.metric("Field Result Categories", fnum(field_body["Field Result"].nunique()))
+        k3.metric("Top Tele Result", top_tele_row["Tele Result"],
+                   f"{fnum(top_tele_row['Total Count'])} accounts", delta_color="off")
+        k4.metric("Top Field Result", top_field_row["Field Result"],
+                   f"{fnum(top_field_row['Total Count'])} accounts", delta_color="off")
+        k5.metric("Total Field Visits Made", fnum(total_visits),
+                   f"Avg {avg_visits:.2f}/account" if pd.notna(avg_visits) else "Avg 0.00/account",
+                   delta_color="off")
+    else:
+        st.info("Not enough Tele/Field Result data in the current filter selection to compute KPIs.")
+
+    st.markdown("### 📞 Tele Result (SubStatus)")
     money_cols = [c for c in tele_matrix.columns if "Balance" in c]
     st.dataframe(
         tele_matrix.style.format({c: PHP for c in money_cols}),
         use_container_width=True, hide_index=True, height=380,
     )
-    tele_body = tele_matrix[tele_matrix["Tele Result"] != "TOTAL"]
 
     st.markdown("### 🚶 Field Result (Fv_Result)")
-    field_matrix = full_status_matrix(filtered, "fv_result", "Field Result")
     money_cols = [c for c in field_matrix.columns if "Balance" in c]
     st.dataframe(
         field_matrix.style.format({c: PHP for c in money_cols}),
         use_container_width=True, hide_index=True, height=460,
     )
-    field_body = field_matrix[field_matrix["Field Result"] != "TOTAL"]
 
     # ---- Total of Visits Made ----
     st.markdown("### 🚗 Field Visit Volume (Total of Visits Made)")
-    visits_acc = distinct_accounts(filtered)
-    total_visits = visits_acc["total_visits"].sum()
-    avg_visits = visits_acc["total_visits"].mean()
     r1 = st.columns(2)
     r1[0].metric("Total Visits", fnum(total_visits))
     r1[1].metric("Average Visits per Account", f"{avg_visits:.2f}" if pd.notna(avg_visits) else "0.00")
@@ -1114,12 +1411,58 @@ with tabs[4]:
     area_mat["Cure Rate %"] = np.where(
         area_mat["Total Count"] > 0, area_mat["Cured Count"] / area_mat["Total Count"] * 100, 0
     )
+    area_body = area_mat[area_mat["AREA"] != "TOTAL"]
+
+    st.markdown("#### 📌 Area KPIs")
+    if not area_body.empty:
+        top_bal_row = area_body.loc[area_body["Total Balance"].idxmax()]
+        top_cure_row = area_body.loc[area_body["Cure Rate %"].idxmax()]
+        low_cure_row = area_body.loc[area_body["Cure Rate %"].idxmin()]
+        avg_cure_rate = area_body["Cure Rate %"].mean()
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Total Areas", fnum(area_body["AREA"].nunique()))
+        k2.metric("Top Area by Balance", top_bal_row["AREA"], PHP(top_bal_row["Total Balance"]))
+        k3.metric("Best Cure Rate", top_cure_row["AREA"], pct(top_cure_row["Cure Rate %"]))
+        k4.metric("⚠️ Needs Attention (Lowest Cure Rate)", low_cure_row["AREA"],
+                   pct(low_cure_row["Cure Rate %"]), delta_color="inverse")
+        k5.metric("Avg Cure Rate Across Areas", pct(avg_cure_rate))
+    else:
+        st.info("Not enough Area data in the current filter selection to compute KPIs.")
+
+    st.markdown("#### 📊 Visit & Conversion KPIs")
+    area_acc = distinct_accounts(filtered)
+    total_accounts_area = area_acc["concat"].nunique()
+    total_visits_area = area_acc["total_visits"].sum()
+    avg_visits_per_agent = (
+        total_visits_area / area_acc["agent"].nunique() if area_acc["agent"].nunique() else 0
+    )
+    ptp_acc_area = area_acc[area_acc["is_valid_ptp"]]
+    ptp_count_area = ptp_acc_area["concat"].nunique()
+    cured_acc_area = area_acc[area_acc["status_norm"] == "Cured"]
+    cure_count_area = cured_acc_area["concat"].nunique()
+    cure_rate_area = (cure_count_area / total_accounts_area * 100) if total_accounts_area else 0
+    conversion_rate_area = (cure_count_area / ptp_count_area * 100) if ptp_count_area else 0
+
+    j1, j2, j3, j4, j5, j6 = st.columns(6)
+    j1.metric("Total Visits", fnum(total_visits_area))
+    j2.metric("Avg Visits per Agent", f"{avg_visits_per_agent:,.2f}")
+    j3.metric("PTP Count", fnum(ptp_count_area))
+    j4.metric("Cure Count", fnum(cure_count_area))
+    render_rate_metric(j5, "Cure Rate", pct(cure_rate_area), cure_rate_area, good=70, warn=40)
+    render_rate_metric(j6, "Conversion Rate (PTP → Cured)", pct(conversion_rate_area),
+                        conversion_rate_area, good=70, warn=40)
+    st.caption(
+        "Average Visits is shown per Agent — the source data records a single cumulative "
+        "**Total of Visits Made** per account rather than per-day visit logs, so a true "
+        "per-day average isn't derivable. Conversion Rate = Cure Count ÷ PTP Count × 100."
+    )
+
     money_cols = [c for c in area_mat.columns if "Balance" in c]
     st.dataframe(
         area_mat.style.format({**{c: PHP for c in money_cols}, "Cure Rate %": "{:.1f}%"}),
         use_container_width=True, hide_index=True, height=380,
     )
-    area_body = area_mat[area_mat["AREA"] != "TOTAL"]
     c1, c2 = st.columns(2)
     with c1:
         fig = px.bar(area_body.sort_values("Total Balance"), x="Total Balance", y="AREA",
@@ -1243,6 +1586,34 @@ with tabs[4]:
 with tabs[5]:
     st.subheader("Area Map Dashboard")
     st.caption("Geographic view based on the **Area List** column, aggregated to Philippine province/region centroids.")
+
+    map_acc = distinct_accounts(filtered)
+    total_accounts_map = map_acc["concat"].nunique()
+    total_visits_map = map_acc["total_visits"].sum()
+    avg_visits_map = map_acc["total_visits"].mean()
+    visited_acc = map_acc[map_acc["total_visits"] > 0]
+    visited_count = visited_acc["concat"].nunique()
+    coverage_rate = (visited_count / total_accounts_map * 100) if total_accounts_map else 0
+    ptp_acc_map = map_acc[map_acc["is_valid_ptp"]]
+    ptp_count_map = ptp_acc_map["concat"].nunique()
+    cured_acc_map = map_acc[map_acc["status_norm"] == "Cured"]
+    cure_count_map = cured_acc_map["concat"].nunique()
+    conversion_rate_map = (cure_count_map / ptp_count_map * 100) if ptp_count_map else 0
+
+    st.markdown("#### 📌 Visit & Coverage KPIs")
+    j1, j2, j3, j4 = st.columns(4)
+    j1.metric("Total Visit Count", fnum(total_visits_map))
+    j2.metric("Average Visit Count", f"{avg_visits_map:,.2f}" if pd.notna(avg_visits_map) else "0.00")
+    j3.metric("Visited Accounts", fnum(visited_count))
+    j4.metric("PTP Count", fnum(ptp_count_map))
+    j5, j6 = st.columns(2)
+    j5.metric("Cure Count", fnum(cure_count_map))
+    render_rate_metric(j6, "PTP-to-Cure Conversion Rate", pct(conversion_rate_map),
+                        conversion_rate_map, good=70, warn=40)
+    k1, _ = st.columns(2)
+    render_rate_metric(k1, "Coverage Rate (Visited ÷ Total Accounts)", pct(coverage_rate),
+                        coverage_rate, good=80, warn=50)
+    st.markdown("---")
 
     map_summary = full_status_matrix(filtered, "area_list", "Area List")
     map_body = map_summary[map_summary["Area List"] != "TOTAL"].copy()
@@ -1487,10 +1858,17 @@ with tabs[8]:
         "concat": "Account Number", "account_name": "Account Name", "industry": "Industry",
         "agent": "Agent", "ob_tad": "OB", "status": "Status", "substatus": "Tele Results",
         "fv_result": "FV Result", "area": "Area", "area_list": "Area Break",
-        "endorsement_date": "Date Endorsed",
+        "endorsement_date": "Date Endorsed", "action_date": "Action Date",
+        "ptp_date": "PTP Date", "ptp_amount": "PTP Amount", "bp_status": "BP?",
     }
     detail = distinct_accounts(filtered)[list(detail_cols.keys())].rename(columns=detail_cols)
     detail["Date Endorsed"] = detail["Date Endorsed"].apply(
+        lambda d: d.strftime("%m/%d/%Y") if pd.notna(d) else ""
+    )
+    detail["Action Date"] = detail["Action Date"].apply(
+        lambda d: d.strftime("%m/%d/%Y") if pd.notna(d) else ""
+    )
+    detail["PTP Date"] = detail["PTP Date"].apply(
         lambda d: d.strftime("%m/%d/%Y") if pd.notna(d) else ""
     )
     st.caption(f"{len(detail):,} distinct accounts")
@@ -1574,6 +1952,13 @@ with tabs[9]:
         }
         st.download_button("⬇️ Download Executive (BOM/FRESH & Balance Distro) Report",
                             to_excel_bytes(exec_sheets), "executive_bom_fresh_baldistro.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        bp_export_sheets = {
+            "Agent PTP & BP": agent_ptp_bp_matrix(filtered),
+        }
+        st.download_button("⬇️ Download Agent PTP & BP Report", to_excel_bytes(bp_export_sheets),
+                            "agent_ptp_bp_report.xlsx",
                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         st.download_button("⬇️ Download Raw (Filtered) Data",
