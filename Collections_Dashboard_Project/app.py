@@ -203,9 +203,9 @@ def traffic_light_color(value, good=70, warn=40, higher_is_better=True):
             return SB_ORANGE
         return SB_RED
     else:
-        if value <= warn:
-            return SB_GREEN
         if value <= good:
+            return SB_GREEN
+        if value <= warn:
             return SB_ORANGE
         return SB_RED
 
@@ -256,6 +256,7 @@ COLUMN_ALIASES = {
     "ptp_date": ["ptp-date", "ptp date", "ptp_date", "promise to pay date"],
     "ptp_amount": ["ptp-amount", "ptp amount", "ptp_amount", "promise to pay amount"],
     "bp_flag": ["bp?", "bp", "broken promise"],
+    "rfd": ["rfd", "reason for default", "reason for disconnection"],
 }
 
 REQUIRED_MIN = ["concat", "ob_tad", "status"]
@@ -336,7 +337,7 @@ def prepare_data(df: pd.DataFrame):
 
     for c in ["status", "substatus", "industry", "agent", "area", "area2",
               "sub_area", "active", "fv_result", "tele_field",
-              "area_list", "cured_flag", "risk_level", "bal_distro", "bp_flag"]:
+              "area_list", "cured_flag", "risk_level", "bal_distro", "bp_flag", "rfd"]:
         work[c] = work[c].astype(str).str.strip()
         work[c] = work[c].replace({"nan": "Unspecified", "": "Unspecified", "None": "Unspecified"})
 
@@ -491,9 +492,13 @@ def agent_matrix(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def agent_ptp_bp_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    """Per-agent PTP (valid PTP Date only), BP, and Cured summary, with conversion rates:
+    """Per-agent PTP (valid PTP Date only), BP, Cured, and RFD summary, with conversion rates:
     - PTP-to-Cured Conversion Rate % = Cured Count / PTP Count * 100
-    - BP-to-PTP Conversion Rate %    = PTP Count / BP Count * 100  (per spec formula)
+    - PTP-to-BP Conversion Rate %    = BP Count / PTP Count * 100
+      (what share of promises made were subsequently broken; lower is better)
+    RFD = most frequent Reason for Default tagged on the agent's accounts (excluding
+    Unspecified); RFD Value = total OB across that agent's RFD-tagged accounts.
+    PTP RFD / BP RFD = count of that agent's RFD-tagged accounts within the PTP / BP subsets.
     PTP Accounts/Amount only count records where PTP Date is present."""
     acc = distinct_accounts(df)
     rows = []
@@ -501,9 +506,11 @@ def agent_ptp_bp_matrix(df: pd.DataFrame) -> pd.DataFrame:
         ptp = grp[grp["is_valid_ptp"]]
         bp = grp[grp["is_bp"]]
         cured = grp[grp["status_norm"] == "Cured"]
+        rfd_tagged = grp[grp["rfd"] != "Unspecified"]
         ptp_accounts = ptp["concat"].nunique()
         bp_count = bp["concat"].nunique()
         cured_count = cured["concat"].nunique()
+        top_rfd = rfd_tagged["rfd"].mode()
         rows.append({
             "Agent": agent,
             "Total Visits": grp["total_visits"].sum(),
@@ -512,11 +519,31 @@ def agent_ptp_bp_matrix(df: pd.DataFrame) -> pd.DataFrame:
             "BP Count": bp_count,
             "BP OB": bp["ob_tad"].sum(),
             "Cured Count": cured_count,
-            "BP Rate % (of PTP)": (bp_count / ptp_accounts * 100) if ptp_accounts else 0,
+            "RFD": top_rfd.iloc[0] if not top_rfd.empty else "—",
+            "RFD Value": rfd_tagged["ob_tad"].sum(),
+            "PTP RFD": ptp[ptp["rfd"] != "Unspecified"]["concat"].nunique(),
+            "BP RFD": bp[bp["rfd"] != "Unspecified"]["concat"].nunique(),
             "PTP-to-Cured Conversion Rate %": (cured_count / ptp_accounts * 100) if ptp_accounts else 0,
-            "BP-to-PTP Conversion Rate %": (ptp_accounts / bp_count * 100) if bp_count else np.nan,
+            "PTP-to-BP Conversion Rate %": (bp_count / ptp_accounts * 100) if ptp_accounts else np.nan,
         })
     return pd.DataFrame(rows).sort_values("PTP Amount", ascending=False)
+
+
+def rfd_summary_by(df: pd.DataFrame, subset: str = "all") -> pd.DataFrame:
+    """RFD (Reason for Default) breakdown. subset: 'all', 'ptp' (valid PTP only),
+    or 'bp' (Broken Promise only)."""
+    acc = distinct_accounts(df)
+    if subset == "ptp":
+        acc = acc[acc["is_valid_ptp"]]
+    elif subset == "bp":
+        acc = acc[acc["is_bp"]]
+    acc = acc[acc["rfd"] != "Unspecified"]
+    if acc.empty:
+        return pd.DataFrame(columns=["RFD", "Count", "Value"])
+    out = acc.groupby("rfd").agg(
+        Count=("concat", "nunique"), Value=("ob_tad", "sum")
+    ).reset_index().rename(columns={"rfd": "RFD"})
+    return out.sort_values("Value", ascending=False)
 
 
 def bp_summary_by(df: pd.DataFrame, group_col: str, label_name: str) -> pd.DataFrame:
@@ -1132,7 +1159,7 @@ with tabs[2]:
     total_bp = ptp_bp_agent["BP Count"].sum() if not ptp_bp_agent.empty else 0
     total_ptp = ptp_bp_agent["PTP Accounts"].sum() if not ptp_bp_agent.empty else 0
     total_cured_agent = ptp_bp_agent["Cured Count"].sum() if not ptp_bp_agent.empty else 0
-    bp_to_ptp_rate = (total_bp / total_ptp * 100) if total_bp else None
+    ptp_to_bp_rate = (total_bp / total_ptp * 100) if total_ptp else 0
     ptp_to_cured_rate = (total_cured_agent / total_ptp * 100) if total_ptp else 0
 
     j1, j2, j3, j4 = st.columns(4)
@@ -1141,10 +1168,10 @@ with tabs[2]:
     j3.metric("PTP Count", fnum(total_ptp))
     j4.metric("Cured Count", fnum(total_cured_agent))
     j5, j6 = st.columns(2)
-    with j5:
-        st.metric("PTP-to-BP Conversion Rate", pct(bp_to_ptp_rate) if bp_to_ptp_rate is not None else "—",
-                   help="PTP Count ÷ BP Count × 100, per spec formula. Since a Broken Promise "
-                        "requires a valid PTP to exist, this is typically ≥100%.")
+    render_rate_metric(j5, "PTP-to-BP Conversion Rate", pct(ptp_to_bp_rate), ptp_to_bp_rate,
+                        good=15, warn=30, higher_is_better=False,
+                        help_text="BP Count ÷ PTP Count × 100 — share of promises that were "
+                                   "later broken. Lower is better.")
     render_rate_metric(j6, "PTP-to-Cured Conversion Rate", pct(ptp_to_cured_rate), ptp_to_cured_rate,
                         good=70, warn=40)
 
@@ -1238,15 +1265,17 @@ with tabs[2]:
         "A record only counts as a PTP when **PTP Date** contains a valid value — blank/null "
         "PTP Dates are excluded from all PTP counts, amounts, and BP calculations below. "
         "PTP-to-Cured Conversion Rate = Cured Count ÷ PTP Count × 100. "
-        "BP-to-PTP Conversion Rate = PTP Count ÷ BP Count × 100."
+        "PTP-to-BP Conversion Rate = BP Count ÷ PTP Count × 100 (share of promises later broken; lower is better). "
+        "RFD = agent's most frequent Reason for Default; RFD Value = OB across the agent's "
+        "RFD-tagged accounts; PTP RFD / BP RFD = how many of those RFD-tagged accounts fall "
+        "within the agent's PTP / BP subsets."
     )
     ptp_bp_agent = agent_ptp_bp_matrix(filtered)  # already computed above for KPIs; re-shown here for context
     st.dataframe(
         ptp_bp_agent.style.format({
-            "Total Visits": "{:,.0f}", "PTP Amount": PHP, "BP OB": PHP,
-            "BP Rate % (of PTP)": "{:.1f}%",
+            "Total Visits": "{:,.0f}", "PTP Amount": PHP, "BP OB": PHP, "RFD Value": PHP,
             "PTP-to-Cured Conversion Rate %": "{:.1f}%",
-            "BP-to-PTP Conversion Rate %": lambda v: "—" if pd.isna(v) else f"{v:.1f}%",
+            "PTP-to-BP Conversion Rate %": lambda v: "—" if pd.isna(v) else f"{v:.1f}%",
         }),
         use_container_width=True, hide_index=True, height=380,
     )
@@ -1265,16 +1294,61 @@ with tabs[2]:
                      color="BP Count", color_continuous_scale=REDS_SCALE)
         st.plotly_chart(fig, use_container_width=True, key="chart_agent_bp_count")
 
+    st.markdown("### 📋 RFD (Reason for Default) Breakdown")
+    rfd_all = rfd_summary_by(filtered, "all")
+    rfd_ptp = rfd_summary_by(filtered, "ptp")
+    rfd_bp = rfd_summary_by(filtered, "bp")
+    if rfd_all.empty:
+        st.info("No RFD (Reason for Default) values detected in this dataset.")
+    else:
+        rfd_tabs = st.tabs(["All Accounts", "PTP RFD", "BP RFD"])
+        with rfd_tabs[0]:
+            c1, c2 = st.columns([2, 3])
+            with c1:
+                st.dataframe(rfd_all.style.format({"Value": PHP}), use_container_width=True,
+                             hide_index=True, height=340)
+            with c2:
+                fig = px.bar(rfd_all.sort_values("Count"), x="Count", y="RFD", orientation="h",
+                             title="RFD Distribution — All Accounts", color="Count",
+                             color_continuous_scale=BLUES_SCALE)
+                st.plotly_chart(fig, use_container_width=True, key="chart_rfd_all")
+        with rfd_tabs[1]:
+            if rfd_ptp.empty:
+                st.info("No RFD-tagged accounts within the PTP subset.")
+            else:
+                c1, c2 = st.columns([2, 3])
+                with c1:
+                    st.dataframe(rfd_ptp.style.format({"Value": PHP}), use_container_width=True,
+                                 hide_index=True, height=340)
+                with c2:
+                    fig = px.bar(rfd_ptp.sort_values("Count"), x="Count", y="RFD", orientation="h",
+                                 title="PTP RFD Distribution", color="Count",
+                                 color_continuous_scale=BLUES_SCALE)
+                    st.plotly_chart(fig, use_container_width=True, key="chart_rfd_ptp")
+        with rfd_tabs[2]:
+            if rfd_bp.empty:
+                st.info("No RFD-tagged accounts within the BP subset.")
+            else:
+                c1, c2 = st.columns([2, 3])
+                with c1:
+                    st.dataframe(rfd_bp.style.format({"Value": PHP}), use_container_width=True,
+                                 hide_index=True, height=340)
+                with c2:
+                    fig = px.bar(rfd_bp.sort_values("Count"), x="Count", y="RFD", orientation="h",
+                                 title="BP RFD Distribution", color="Count",
+                                 color_continuous_scale=REDS_SCALE)
+                    st.plotly_chart(fig, use_container_width=True, key="chart_rfd_bp")
+
     with st.expander("🔎 Drill down: PTP records for a specific agent"):
         agent_options = sorted(ptp_bp_agent["Agent"].unique())
         if agent_options:
             sel_agent = st.selectbox("Select an Agent", agent_options, key="agent_ptp_drilldown")
             agent_ptp_rows = distinct_accounts(
                 filtered[(filtered["agent"] == sel_agent) & (filtered["is_valid_ptp"])]
-            )[["concat", "account_name", "action_date", "ptp_date", "ptp_amount", "ob_tad", "bp_status"]].rename(
+            )[["concat", "account_name", "action_date", "ptp_date", "ptp_amount", "ob_tad", "bp_status", "rfd"]].rename(
                 columns={"concat": "Account Number", "account_name": "Account Name",
                          "action_date": "Action Date", "ptp_date": "PTP Date",
-                         "ptp_amount": "PTP Amount", "ob_tad": "OB", "bp_status": "BP?"}
+                         "ptp_amount": "PTP Amount", "ob_tad": "OB", "bp_status": "BP?", "rfd": "RFD"}
             ).sort_values("PTP Date", ascending=False)
             agent_ptp_rows["Action Date"] = agent_ptp_rows["Action Date"].apply(
                 lambda d: d.strftime("%m/%d/%Y") if pd.notna(d) else "")
@@ -1407,11 +1481,12 @@ with tabs[3]:
 
 with tabs[4]:
     st.subheader("Area Performance")
-    area_mat = full_status_matrix(filtered, "area", "AREA")
+    st.caption("Area data is sourced from the **AREA2** field.")
+    area_mat = full_status_matrix(filtered, "area2", "AREA2")
     area_mat["Cure Rate %"] = np.where(
         area_mat["Total Count"] > 0, area_mat["Cured Count"] / area_mat["Total Count"] * 100, 0
     )
-    area_body = area_mat[area_mat["AREA"] != "TOTAL"]
+    area_body = area_mat[area_mat["AREA2"] != "TOTAL"]
 
     st.markdown("#### 📌 Area KPIs")
     if not area_body.empty:
@@ -1421,10 +1496,10 @@ with tabs[4]:
         avg_cure_rate = area_body["Cure Rate %"].mean()
 
         k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Total Areas", fnum(area_body["AREA"].nunique()))
-        k2.metric("Top Area by Balance", top_bal_row["AREA"], PHP(top_bal_row["Total Balance"]))
-        k3.metric("Best Cure Rate", top_cure_row["AREA"], pct(top_cure_row["Cure Rate %"]))
-        k4.metric("⚠️ Needs Attention (Lowest Cure Rate)", low_cure_row["AREA"],
+        k1.metric("Total Areas", fnum(area_body["AREA2"].nunique()))
+        k2.metric("Top Area by Balance", top_bal_row["AREA2"], PHP(top_bal_row["Total Balance"]))
+        k3.metric("Best Cure Rate", top_cure_row["AREA2"], pct(top_cure_row["Cure Rate %"]))
+        k4.metric("⚠️ Needs Attention (Lowest Cure Rate)", low_cure_row["AREA2"],
                    pct(low_cure_row["Cure Rate %"]), delta_color="inverse")
         k5.metric("Avg Cure Rate Across Areas", pct(avg_cure_rate))
     else:
@@ -1434,9 +1509,7 @@ with tabs[4]:
     area_acc = distinct_accounts(filtered)
     total_accounts_area = area_acc["concat"].nunique()
     total_visits_area = area_acc["total_visits"].sum()
-    avg_visits_per_agent = (
-        total_visits_area / area_acc["agent"].nunique() if area_acc["agent"].nunique() else 0
-    )
+    unique_total_visits_area = area_acc[area_acc["total_visits"] > 0]["concat"].nunique()
     ptp_acc_area = area_acc[area_acc["is_valid_ptp"]]
     ptp_count_area = ptp_acc_area["concat"].nunique()
     cured_acc_area = area_acc[area_acc["status_norm"] == "Cured"]
@@ -1446,16 +1519,16 @@ with tabs[4]:
 
     j1, j2, j3, j4, j5, j6 = st.columns(6)
     j1.metric("Total Visits", fnum(total_visits_area))
-    j2.metric("Avg Visits per Agent", f"{avg_visits_per_agent:,.2f}")
+    j2.metric("Unique Total Visits", fnum(unique_total_visits_area))
     j3.metric("PTP Count", fnum(ptp_count_area))
     j4.metric("Cure Count", fnum(cure_count_area))
     render_rate_metric(j5, "Cure Rate", pct(cure_rate_area), cure_rate_area, good=70, warn=40)
     render_rate_metric(j6, "Conversion Rate (PTP → Cured)", pct(conversion_rate_area),
                         conversion_rate_area, good=70, warn=40)
     st.caption(
-        "Average Visits is shown per Agent — the source data records a single cumulative "
-        "**Total of Visits Made** per account rather than per-day visit logs, so a true "
-        "per-day average isn't derivable. Conversion Rate = Cure Count ÷ PTP Count × 100."
+        "Total Visits sums the **Total of Visits Made** field across all accounts. Unique Total "
+        "Visits counts distinct accounts with at least one recorded visit. "
+        "Conversion Rate = Cure Count ÷ PTP Count × 100."
     )
 
     money_cols = [c for c in area_mat.columns if "Balance" in c]
@@ -1465,21 +1538,21 @@ with tabs[4]:
     )
     c1, c2 = st.columns(2)
     with c1:
-        fig = px.bar(area_body.sort_values("Total Balance"), x="Total Balance", y="AREA",
+        fig = px.bar(area_body.sort_values("Total Balance"), x="Total Balance", y="AREA2",
                      orientation="h", title="Area Ranking by Balance", color="Total Balance",
                      color_continuous_scale=BLUES_SCALE)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_31")
     with c2:
-        m = area_body[["AREA", "Active Count", "Cured Count", "Flowed Count"]].melt(
-            id_vars="AREA", value_vars=["Active Count", "Cured Count", "Flowed Count"],
+        m = area_body[["AREA2", "Active Count", "Cured Count", "Flowed Count"]].melt(
+            id_vars="AREA2", value_vars=["Active Count", "Cured Count", "Flowed Count"],
             var_name="Status", value_name="Accounts",
         )
         m["Status"] = m["Status"].str.replace(" Count", "")
-        fig = px.bar(m, x="AREA", y="Accounts", color="Status", barmode="stack",
+        fig = px.bar(m, x="AREA2", y="Accounts", color="Status", barmode="stack",
                      color_discrete_map=STATUS_COLORS, title="Area Status Breakdown")
         st.plotly_chart(fig, use_container_width=True, key=f"chart_32")
 
-    fig = px.treemap(area_body, path=["AREA"], values="Total Balance",
+    fig = px.treemap(area_body, path=["AREA2"], values="Total Balance",
                       color="Total Balance", color_continuous_scale=BLUES_SCALE,
                       title="Area Treemap (by Balance)")
     st.plotly_chart(fig, use_container_width=True, key=f"chart_33")
@@ -1566,15 +1639,15 @@ with tabs[4]:
                      .style.format({"Balance": PHP}), use_container_width=True, hide_index=True, height=350)
 
     st.markdown("### 💚 Cured Accounts & Balance by Area")
-    cure_area = cure_summary_by(filtered, "area", "AREA")
+    cure_area = cure_summary_by(filtered, "area2", "AREA2")
     c1, c2 = st.columns(2)
     with c1:
-        fig = px.bar(cure_area.sort_values("Cured Accounts"), x="Cured Accounts", y="AREA",
+        fig = px.bar(cure_area.sort_values("Cured Accounts"), x="Cured Accounts", y="AREA2",
                      orientation="h", title="Cured Accounts by Area", color="Cured Accounts",
                      color_continuous_scale=GREENS_SCALE)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_36")
     with c2:
-        fig = px.bar(cure_area.sort_values("Cured Balance"), x="Cured Balance", y="AREA",
+        fig = px.bar(cure_area.sort_values("Cured Balance"), x="Cured Balance", y="AREA2",
                      orientation="h", title="Cured Balance by Area", color="Cured Balance",
                      color_continuous_scale=GREENS_SCALE)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_37")
@@ -1791,7 +1864,8 @@ with tabs[7]:
     )
 
     st.markdown("### Cured Analysis by Area")
-    cure_area = cure_summary_by(filtered, "area", "AREA")
+    st.caption("Area data is sourced from the **AREA2** field.")
+    cure_area = cure_summary_by(filtered, "area2", "AREA2")
     st.dataframe(
         cure_area.style.format({"Cured Balance": PHP, "Cure Rate %": "{:.1f}%"}),
         use_container_width=True, hide_index=True,
@@ -1810,7 +1884,7 @@ with tabs[7]:
                      color_continuous_scale=GREENS_SCALE)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_44")
     with c3:
-        fig = px.bar(cure_area.sort_values("Cured Accounts"), x="Cured Accounts", y="AREA",
+        fig = px.bar(cure_area.sort_values("Cured Accounts"), x="Cured Accounts", y="AREA2",
                      orientation="h", title="Cured Accounts by Area", color="Cured Accounts",
                      color_continuous_scale=GREENS_SCALE)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_45")
@@ -1827,7 +1901,7 @@ with tabs[7]:
                      color_continuous_scale=GREENS_SCALE)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_47")
     with c6:
-        fig = px.bar(cure_area.sort_values("Cured Balance"), x="Cured Balance", y="AREA",
+        fig = px.bar(cure_area.sort_values("Cured Balance"), x="Cured Balance", y="AREA2",
                      orientation="h", title="Cured Balance by Area", color="Cured Balance",
                      color_continuous_scale=GREENS_SCALE)
         st.plotly_chart(fig, use_container_width=True, key=f"chart_48")
@@ -1916,7 +1990,7 @@ with tabs[9]:
                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         area_sheets = {
-            "Area": full_status_matrix(filtered, "area", "AREA"),
+            "Area (AREA2)": full_status_matrix(filtered, "area2", "AREA2"),
             "Area Break (Area List)": summarize_by(filtered, "area_list"),
             "Sub Area": summarize_by(filtered, "sub_area"),
         }
@@ -1940,7 +2014,7 @@ with tabs[9]:
         cured_sheets = {
             "Cured by Industry": cure_summary_by(filtered, "industry", "Industry"),
             "Cured by Agent": cure_summary_by(filtered, "agent", "Agent"),
-            "Cured by Area": cure_summary_by(filtered, "area", "AREA"),
+            "Cured by Area (AREA2)": cure_summary_by(filtered, "area2", "AREA2"),
         }
         st.download_button("⬇️ Download Cured/Payment Report", to_excel_bytes(cured_sheets),
                             "cured_payment_report.xlsx",
